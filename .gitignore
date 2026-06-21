@@ -7,3 +7,17 @@ __pycache__/
 *RawData
 .compressor
 *credential.csv
+*.pdf
+nohup.out
+*.log
+
+# local datasets and runtime artifacts
+examples/datasets/
+data/
+
+# virtual / conda environments
+.venv/
+venv/
+env/
+.env
+*.tar.gz
