@@ -325,7 +325,7 @@ def get_mnist(
         train_datasets = iid_partition(train_data_raw, num_clients)
     elif partition_strategy == "class_noniid":
         train_datasets = class_noniid_partition(train_data_raw, num_clients, **kwargs)
-    elif partition_strategy == "dirichlet_nomiid":
+    elif partition_strategy in {"dirichlet_noniid", "dirichlet_nomiid"}:
         train_datasets = dirichlet_noniid_partition(train_data_raw, num_clients, **kwargs)
     else:
         raise ValueError(f"Invalid partition strategy: {partition_strategy}")
