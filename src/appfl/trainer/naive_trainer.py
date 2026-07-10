@@ -227,7 +227,6 @@ class NaiveTrainer(BaseTrainer):
         output = self.model(data)
         loss = self.loss_fn(output, target)
         loss.backward()
-        optimizer.step()
         if self.train_configs.get("clip_grad", False) or self.train_configs.get("use_dp", False):
             assert hasattr(self.train_configs, "clip_value"), "Gradient clipping value must be specified"
             assert hasattr(self.train_configs, "clip_norm"), "Gradient clipping norm must be specified"
@@ -236,6 +235,7 @@ class NaiveTrainer(BaseTrainer):
                 self.train_configs.clip_value,
                 norm_type=self.train_configs.clip_norm,
             )
+        optimizer.step()
         return loss.item(), output.detach().cpu().numpy(), target.detach().cpu().numpy()
     
     def _compute_gradient(self) -> None:

@@ -1,0 +1,70 @@
+# SU-Compass 虚拟时间实验 — FedCompass + MNIST 8 客户端
+# 对齐 ICLR 2024 Appendix E.2 Table 9：Qmin=40, Qmax=200, lr=0.003, λ=1.2
+
+client_configs:
+  train_configs:
+    device: "cuda"
+    trainer: "NaiveTrainer"
+    mode: "step"
+    num_local_steps: 40
+    optim: "Adam"
+    optim_args:
+      lr: 0.003
+    loss_fn_path: "./loss/celoss.py"
+    loss_fn_name: "CELoss"
+    do_validation: True
+    do_pre_validation: False
+    metric_path: "./metric/acc.py"
+    metric_name: "accuracy"
+    use_dp: False
+    epsilon: 1
+    clip_grad: False
+    clip_value: 1
+    clip_norm: 1
+    send_gradient: True
+    train_batch_size: 64
+    val_batch_size: 64
+    train_data_shuffle: True
+    val_data_shuffle: False
+
+  model_configs:
+    model_path: "./model/cnn.py"
+    model_name: "CNN"
+    model_kwargs:
+      num_channel: 1
+      num_classes: 10
+      num_pixel: 28
+
+  comm_configs:
+    compressor_configs:
+      enable_compression: False
+      lossy_compressor: "SZ2"
+      lossless_compressor: "blosc"
+      error_bounding_mode: "REL"
+      error_bound: 1e-3
+      flat_model_dtype: "np.float32"
+      param_cutoff: 1024
+
+server_configs:
+  scheduler: "CompassScheduler"
+  scheduler_kwargs:
+    num_clients: 8
+    same_init_model: True
+    max_local_steps: 200
+    min_local_steps: 40
+    speed_momentum: 0.9
+    latest_time_factor: 1.2
+  aggregator: "FedCompassAggregator"
+  aggregator_kwargs:
+    weights: "equal"
+    staleness_fn: "polynomial"
+    staleness_fn_kwargs:
+      a: 0.5
+    alpha: 0.9
+    gradient_based: True
+    num_clients: 8
+  device: "cuda"
+  num_global_epochs: 50
+  server_validation: False
+  logging_output_dirname: "./output"
+  logging_output_filename: "virtual_fedcompass_mnist8"

@@ -1,0 +1,78 @@
+# SU-Compass CIFAR-10 主实验配置。
+# 训练超参数对齐 FedCompass ICLR 2024 Appendix E.3 / Table 12；
+# 关闭不参与调度的本地验证，并加入梯度范数保护以防异常批次污染全局模型。
+
+client_configs:
+  train_configs:
+    device: "cuda"
+    trainer: "NaiveTrainer"
+    mode: "step"
+    num_local_steps: 40
+    optim: "SGD"
+    optim_args:
+      lr: 0.1
+      momentum: 0.0
+      weight_decay: 0.0
+    loss_fn_path: "./loss/celoss.py"
+    loss_fn_name: "CELoss"
+    do_validation: False
+    do_pre_validation: False
+    metric_path: "./metric/acc.py"
+    metric_name: "accuracy"
+    use_dp: False
+    epsilon: 1
+    clip_grad: True
+    clip_value: 10.0
+    clip_norm: 2
+    send_gradient: True
+    train_batch_size: 128
+    val_batch_size: 128
+    train_data_shuffle: True
+    val_data_shuffle: False
+
+  model_configs:
+    model_path: "./model/resnet18.py"
+    model_name: "ResNet18"
+    model_kwargs:
+      num_channel: 3
+      num_classes: 10
+      num_pixel: 32
+
+  comm_configs:
+    compressor_configs:
+      enable_compression: False
+      lossy_compressor: "SZ2"
+      lossless_compressor: "blosc"
+      error_bounding_mode: "REL"
+      error_bound: 1e-3
+      flat_model_dtype: "np.float32"
+      param_cutoff: 1024
+
+server_configs:
+  scheduler: "CompassScheduler"
+  scheduler_kwargs:
+    num_clients: 8
+    same_init_model: True
+    max_local_steps: 200
+    min_local_steps: 40
+    speed_momentum: 0.9
+    latest_time_factor: 1.2
+  aggregator: "FedCompassAggregator"
+  aggregator_kwargs:
+    weights: "equal"
+    staleness_fn: "polynomial"
+    staleness_fn_kwargs:
+      a: 0.5
+    alpha: 0.9
+    gradient_based: True
+    num_clients: 8
+  device: "cuda"
+  num_global_epochs: 600
+  server_validation: False
+  logging_output_dirname: "./output"
+  logging_output_filename: "virtual_fedcompass_cifar10_8"
+  comm_configs:
+    grpc_configs:
+      server_uri: localhost:50051
+      max_message_size: 1048576
+      use_ssl: False

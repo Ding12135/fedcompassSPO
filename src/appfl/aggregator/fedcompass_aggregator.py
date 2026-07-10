@@ -77,7 +77,9 @@ class FedCompassAggregator(BaseAggregator):
             return lambda u : 1
         elif staleness_fn_name == "polynomial":
             a = kwargs['a']
-            return lambda u:  (u + 1) ** a
+            # FedCompass uses st(u) = (u + 1)^(-a): stale updates must be
+            # down-weighted rather than amplified.
+            return lambda u:  (u + 1) ** (-a)
         elif staleness_fn_name == "hinge":
             a = kwargs['a']
             b = kwargs['b']

@@ -77,7 +77,9 @@ class FedAsyncAggregator(BaseAggregator):
             return lambda u : 1
         elif staleness_fn_name == "polynomial":
             a = kwargs['a']
-            return lambda u:  (u + 1) ** a
+            # Polynomial staleness decays as defined by FedAsync/FedCompass:
+            # st(u) = (u + 1)^(-a).
+            return lambda u:  (u + 1) ** (-a)
         elif staleness_fn_name == "hinge":
             a = kwargs['a']
             b = kwargs['b']
