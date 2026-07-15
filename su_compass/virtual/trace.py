@@ -136,7 +136,7 @@ OORT_TRACE_FIELDS = [
 ]
 
 RUP_TRACE_FIELDS = [
-    "virtual_time", "client_id", "profile_type", "decision", "assigned_group",
+    "virtual_time", "dispatch_id", "client_dispatch_idx", "client_id", "profile_type", "decision", "assigned_group",
     "mode", "baseline_q", "raw_state_q", "trust_q", "soft_q", "utility_q",
     "budget_q", "recommended_q", "applied_q", "state_safe_feasible",
     "num_safe_candidates", "predicted_finish_time", "safe_finish_time",
@@ -144,12 +144,30 @@ RUP_TRACE_FIELDS = [
     "residual_count", "trust_lower", "trust_upper", "utility_raw",
     "utility_normalized", "utility_confidence", "utility_reports", "loss_ema",
     "progress_ema", "budget_ratio_before", "budget_debt_before",
-    "budget_adjustment", "pre_accuracy_q", "accuracy_priority_q",
+    "budget_adjustment", "unconstrained_q", "cumulative_baseline_before",
+    "cumulative_applied_before", "cumulative_work_ratio_before",
+    "cumulative_work_debt_before", "cumulative_work_debt_limit",
+    "cumulative_budget_guard_applied", "debt_repayment_applied",
+    "budget_control_reason", "required_guard_q",
+    "budget_eligible_safe_candidates", "repayment_headroom_q",
+    "cumulative_work_ratio_after", "cumulative_work_debt_after",
+    "safe_q_min", "safe_q_max", "baseline_q_safe", "applied_q_safe",
+    "predicted_deadline_slack", "pre_accuracy_q", "accuracy_priority_q",
     "accuracy_floor_applied", "accuracy_boost_applied",
     "current_global_accuracy", "accuracy_boost_stage_active",
     "risk_gated_floor_allowed", "pre_smooth_q", "smooth_q", "q_smooth_applied",
     "previous_q", "hit_hard_qmin", "hit_hard_qmax", "hit_soft_qmin", "hit_soft_qmax",
     "fallback_reason", "enabled_layers",
+]
+
+RUP_OUTCOME_TRACE_FIELDS = [
+    "dispatch_id", "client_dispatch_idx", "client_id", "dispatch_time",
+    "upload_time", "assigned_group", "baseline_q", "applied_q",
+    "predicted_duration", "safe_duration", "actual_duration",
+    "prediction_error", "absolute_prediction_error", "relative_prediction_error",
+    "expected_arrival_time", "latest_arrival_time", "predicted_finish_time",
+    "safe_finish_time", "residual_margin", "safe_duration_exceeded",
+    "deadline_miss",
 ]
 
 RUP_TRAINING_TRACE_FIELDS = [
@@ -450,6 +468,8 @@ class TraceWriter:
         self.dispatch_decision_rows: List[Dict[str, Any]] = []
         self.oort_rows: List[Dict[str, Any]] = []
         self.rup_rows: List[Dict[str, Any]] = []
+        self.rup_outcome_rows: List[Dict[str, Any]] = []
+        self.rup_terminal_state: Optional[Dict[str, Any]] = None
         self.rup_training_rows: List[Dict[str, Any]] = []
         self.state_q_rows: List[Dict[str, Any]] = []
         self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
@@ -556,6 +576,13 @@ class TraceWriter:
     def record_rup_training(self, row: Dict[str, Any]) -> None:
         """Record local loss/prox facts independently from scheduling traces."""
         self.rup_training_rows.append(row)
+
+    def record_rup_outcome(self, row: Dict[str, Any]) -> None:
+        """Record realized duration and deadline outcome for one RUP dispatch."""
+        self.rup_outcome_rows.append(row)
+
+    def set_rup_terminal_state(self, row: Dict[str, Any]) -> None:
+        self.rup_terminal_state = dict(row)
 
     def record_state_q_decision(self, row: Dict[str, Any]) -> None:
         """记录StateCompass真正应用Q时的基线/新Q对照与group mismatch。"""
@@ -804,6 +831,17 @@ class TraceWriter:
             _write_csv(self.output_dir / "oort_trace.csv", self.oort_rows, OORT_TRACE_FIELDS)
         if self.rup_rows:
             _write_csv(self.output_dir / "rup_decision_trace.csv", self.rup_rows, RUP_TRACE_FIELDS)
+        if self.rup_outcome_rows:
+            _write_csv(
+                self.output_dir / "rup_outcome_trace.csv",
+                self.rup_outcome_rows,
+                RUP_OUTCOME_TRACE_FIELDS,
+            )
+        if self.rup_terminal_state is not None:
+            _write_json(
+                self.output_dir / "rup_terminal_state.json",
+                self.rup_terminal_state,
+            )
         if self.rup_training_rows:
             _write_csv(
                 self.output_dir / "rup_training_trace.csv",

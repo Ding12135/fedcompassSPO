@@ -47,8 +47,15 @@ class VirtualRUPCompassController(VirtualFedCompassController):
         if report is not None:
             self._rup_policy.observe_upload(
                 event.client_id, report.round_time, observation,
+                upload_time=virtual_now, late=bool(report.late),
             )
         return super().on_client_upload(event, virtual_now)
+
+    def pop_rup_outcomes(self) -> List[Dict[str, Any]]:
+        return self._rup_policy.pop_outcomes()
+
+    def get_rup_terminal_state(self) -> Dict[str, Any]:
+        return self._rup_policy.terminal_state()
 
     def _assign_group(self, client_id: str):
         """Trace first/new-group passthroughs; existing-group decisions trace themselves."""

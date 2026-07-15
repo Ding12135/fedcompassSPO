@@ -47,6 +47,9 @@ class RUPConfig:
     budget_lower_ratio: float = 0.97
     budget_upper_ratio: float = 1.03
     budget_max_adjust_ratio: float = 0.10
+    cumulative_budget_guard_enabled: bool = False
+    max_work_debt_ratio: float = 0.01
+    debt_repay_utility_threshold: float = 1.0
     accuracy_priority_enabled: bool = True
     accuracy_q_floor_ratio: float = 1.0
     accuracy_q_boost_ratio: float = 0.05
@@ -74,6 +77,10 @@ class RUPConfig:
             raise ValueError("utility bounds must contain 1")
         if not 0 < self.budget_lower_ratio <= 1 <= self.budget_upper_ratio:
             raise ValueError("budget bounds must contain 1")
+        if not 0 <= self.max_work_debt_ratio < 1:
+            raise ValueError("max_work_debt_ratio must be in [0, 1)")
+        if self.debt_repay_utility_threshold < 0:
+            raise ValueError("debt_repay_utility_threshold must be non-negative")
         if self.residual_window < 1 or self.budget_window < 1:
             raise ValueError("residual and budget windows must be positive")
         if self.state_warmup_reports < 0 or self.utility_min_reports < 1:
@@ -110,6 +117,8 @@ class _UtilityState:
 
 @dataclass(frozen=True)
 class RUPDecision:
+    dispatch_id: int
+    client_dispatch_idx: int
     client_id: str
     mode: str
     baseline_q: int
@@ -139,6 +148,25 @@ class RUPDecision:
     budget_ratio_before: float
     budget_debt_before: int
     budget_adjustment: int
+    unconstrained_q: int
+    cumulative_baseline_before: int
+    cumulative_applied_before: int
+    cumulative_work_ratio_before: float
+    cumulative_work_debt_before: int
+    cumulative_work_debt_limit: int
+    cumulative_budget_guard_applied: bool
+    debt_repayment_applied: bool
+    budget_control_reason: str
+    required_guard_q: int
+    budget_eligible_safe_candidates: int
+    repayment_headroom_q: int
+    cumulative_work_ratio_after: float
+    cumulative_work_debt_after: int
+    safe_q_min: int
+    safe_q_max: int
+    baseline_q_safe: bool
+    applied_q_safe: bool
+    predicted_deadline_slack: float
     pre_accuracy_q: int
     accuracy_priority_q: int
     accuracy_floor_applied: bool
@@ -164,6 +192,8 @@ class RUPDecision:
             "state_safe_feasible", "accuracy_floor_applied",
             "accuracy_boost_applied", "accuracy_boost_stage_active",
             "risk_gated_floor_allowed", "q_smooth_applied",
+            "cumulative_budget_guard_applied", "debt_repayment_applied",
+            "baseline_q_safe", "applied_q_safe",
             "hit_hard_qmin", "hit_hard_qmax",
             "hit_soft_qmin", "hit_soft_qmax",
         ):
@@ -181,9 +211,14 @@ class RUPWorkloadPolicy:
         self._residuals: Dict[str, Deque[float]] = defaultdict(
             lambda: deque(maxlen=config.residual_window)
         )
-        self._pending_prediction: Dict[str, float] = {}
+        self._pending_prediction: Dict[str, Dict[str, Any]] = {}
+        self._outcome_buffer: list[Dict[str, Any]] = []
+        self._dispatch_id = 0
+        self._client_dispatch_idx: Dict[str, int] = defaultdict(int)
         self._previous_q: Dict[str, int] = {}
         self._budget: Deque[tuple[int, int]] = deque(maxlen=config.budget_window)
+        self._cumulative_baseline_q = 0
+        self._cumulative_applied_q = 0
         self._current_global_accuracy: Optional[float] = None
 
     def update_global_accuracy(self, accuracy: Optional[float]) -> None:
@@ -191,10 +226,24 @@ class RUPWorkloadPolicy:
             return
         self._current_global_accuracy = float(accuracy)
 
-    def observe_upload(self, client_id: str, actual_duration: float, observation: Any = None) -> None:
+    def observe_upload(
+        self, client_id: str, actual_duration: float, observation: Any = None,
+        *, upload_time: Optional[float] = None, late: bool = False,
+    ) -> None:
         predicted = self._pending_prediction.pop(client_id, None)
         if predicted is not None and math.isfinite(actual_duration):
-            self._residuals[client_id].append(float(actual_duration) - predicted)
+            prediction_error = float(actual_duration) - predicted["predicted_duration"]
+            self._residuals[client_id].append(prediction_error)
+            self._outcome_buffer.append({
+                **predicted,
+                "upload_time": upload_time if upload_time is not None else "",
+                "actual_duration": float(actual_duration),
+                "prediction_error": prediction_error,
+                "absolute_prediction_error": abs(prediction_error),
+                "relative_prediction_error": prediction_error / max(float(actual_duration), 1e-8),
+                "safe_duration_exceeded": int(float(actual_duration) > predicted["safe_duration"]),
+                "deadline_miss": int(bool(late)),
+            })
         if observation is None or not getattr(observation, "finite", False):
             return
         loss = getattr(observation, "loss_before", None)
@@ -211,6 +260,27 @@ class RUPWorkloadPolicy:
             )
         state.num_samples = max(1, int(getattr(observation, "num_train_samples", 1)))
         state.reports += 1
+
+    def pop_outcomes(self) -> list[Dict[str, Any]]:
+        rows = list(self._outcome_buffer)
+        self._outcome_buffer.clear()
+        return rows
+
+    def terminal_state(self) -> Dict[str, Any]:
+        return {
+            "dispatched_baseline_work": self._cumulative_baseline_q,
+            "dispatched_applied_work": self._cumulative_applied_q,
+            "final_work_debt": self._cumulative_baseline_q - self._cumulative_applied_q,
+            "final_work_ratio": self._cumulative_applied_q / max(self._cumulative_baseline_q, 1),
+            "pending_dispatches": len(self._pending_prediction),
+            "pending_clients": sorted(self._pending_prediction),
+        }
+
+    def _next_dispatch_ids(self, client_id: str) -> tuple[int, int]:
+        self._dispatch_id += 1
+        idx = self._client_dispatch_idx[client_id]
+        self._client_dispatch_idx[client_id] += 1
+        return self._dispatch_id, idx
 
     def passthrough(
         self, *, client_id: str, q: int, dispatch_time: float,
@@ -397,7 +467,72 @@ class RUPWorkloadPolicy:
             else:
                 smooth_q = smooth_target
 
-        recommended_q = min(max(int(smooth_q), qmin), qmax)
+        unconstrained_q = min(max(int(smooth_q), qmin), qmax)
+        recommended_q = unconstrained_q
+        cumulative_baseline_before = self._cumulative_baseline_q
+        cumulative_applied_before = self._cumulative_applied_q
+        cumulative_debt_before = cumulative_baseline_before - cumulative_applied_before
+        cumulative_ratio_before = (
+            cumulative_applied_before / cumulative_baseline_before
+            if cumulative_baseline_before else 1.0
+        )
+        cumulative_debt_limit = int(math.floor(
+            (cumulative_baseline_before + baseline_q) * cfg.max_work_debt_ratio
+        ))
+        cumulative_budget_guard_applied = False
+        debt_repayment_applied = False
+        budget_control_reason = "guard_disabled" if not cfg.cumulative_budget_guard_enabled else "within_debt_limit"
+        required_guard_q = 0
+        repayment_headroom_q = 0
+        eligible = [q for q in safe_qs if trust_lower <= q <= trust_upper]
+        if cfg.cumulative_budget_guard_enabled and cfg.mode != "shadow":
+            projected_debt = (
+                cumulative_debt_before + baseline_q - recommended_q
+            )
+            if projected_debt > cumulative_debt_limit:
+                required_q = (
+                    cumulative_debt_before + baseline_q - cumulative_debt_limit
+                )
+                required_guard_q = required_q
+                guard_candidates = [q for q in eligible if q >= required_q]
+                if guard_candidates:
+                    recommended_q = min(guard_candidates)
+                    budget_control_reason = "debt_guard_safe_candidate"
+                else:
+                    # FedCompass's own Q is the conservative workload fallback.
+                    # Keeping it prevents the safety model from silently eroding
+                    # the optimization budget when no RUP-safe candidate can pay.
+                    recommended_q = baseline_q
+                    budget_control_reason = "debt_guard_baseline_fallback"
+                cumulative_budget_guard_applied = recommended_q != unconstrained_q
+            elif (
+                cumulative_debt_before > 0
+                and utility_norm >= cfg.debt_repay_utility_threshold
+                and utility_conf > 0
+            ):
+                repay_cap = baseline_q + max(
+                    1, int(round(baseline_q * cfg.budget_max_adjust_ratio))
+                )
+                repay_target = min(
+                    qmax, repay_cap, baseline_q + cumulative_debt_before
+                )
+                repayment_headroom_q = max(0, repay_target - recommended_q)
+                repay_candidates = [
+                    q for q in eligible
+                    if recommended_q < q <= repay_target
+                ]
+                if repay_candidates:
+                    recommended_q = max(repay_candidates)
+                    debt_repayment_applied = True
+                    budget_control_reason = "utility_debt_repayment"
+                elif not eligible:
+                    budget_control_reason = "repayment_blocked_no_safe_trust_candidate"
+                elif repay_target <= recommended_q:
+                    budget_control_reason = "repayment_blocked_no_headroom"
+                else:
+                    budget_control_reason = "repayment_blocked_candidate_gap"
+            elif cumulative_debt_before > 0:
+                budget_control_reason = "repayment_waiting_for_utility"
         applied_q = baseline_q if cfg.mode == "shadow" else recommended_q
         chosen = predictions.get(recommended_q)
         if chosen is None:
@@ -409,14 +544,37 @@ class RUPWorkloadPolicy:
             safe_finish = chosen[1]
             chosen_margin = chosen[2]
         actual_prediction = predictions.get(applied_q)
+        dispatch_id, client_dispatch_idx = self._next_dispatch_ids(client_id)
         if actual_prediction is not None:
             # Residual calibration must follow the Q that was really dispatched;
             # in shadow mode this is the FedCompass Q, not the recommendation.
-            self._pending_prediction[client_id] = actual_prediction[0].predicted_duration
+            self._pending_prediction[client_id] = {
+                "dispatch_id": dispatch_id,
+                "client_dispatch_idx": client_dispatch_idx,
+                "client_id": client_id,
+                "dispatch_time": dispatch_time,
+                "assigned_group": -1,
+                "baseline_q": baseline_q,
+                "applied_q": applied_q,
+                "predicted_duration": actual_prediction[0].predicted_duration,
+                "safe_duration": actual_prediction[1] - dispatch_time,
+                "expected_arrival_time": expected_arrival_time,
+                "latest_arrival_time": latest_arrival_time,
+                "predicted_finish_time": actual_prediction[0].predicted_finish_time,
+                "safe_finish_time": actual_prediction[1],
+                "residual_margin": actual_prediction[2],
+            }
 
+        cumulative_baseline_after = cumulative_baseline_before + baseline_q
+        cumulative_applied_after = cumulative_applied_before + applied_q
+        cumulative_debt_after = cumulative_baseline_after - cumulative_applied_after
+        cumulative_ratio_after = cumulative_applied_after / cumulative_baseline_after
+        self._cumulative_baseline_q = cumulative_baseline_after
+        self._cumulative_applied_q = cumulative_applied_after
         self._previous_q[client_id] = applied_q
         self._budget.append((baseline_q, applied_q))
         return RUPDecision(
+            dispatch_id=dispatch_id, client_dispatch_idx=client_dispatch_idx,
             client_id=client_id, mode=cfg.mode, baseline_q=baseline_q,
             raw_state_q=raw_state_q, trust_q=trust_q, soft_q=soft_q,
             utility_q=utility_q, budget_q=budget_q, recommended_q=recommended_q,
@@ -430,6 +588,25 @@ class RUPWorkloadPolicy:
             utility_reports=utility_state.reports, loss_ema=utility_state.loss_ema,
             progress_ema=utility_state.progress_ema, budget_ratio_before=ratio_before,
             budget_debt_before=debt_before, budget_adjustment=budget_adjustment,
+            unconstrained_q=unconstrained_q,
+            cumulative_baseline_before=cumulative_baseline_before,
+            cumulative_applied_before=cumulative_applied_before,
+            cumulative_work_ratio_before=cumulative_ratio_before,
+            cumulative_work_debt_before=cumulative_debt_before,
+            cumulative_work_debt_limit=cumulative_debt_limit,
+            cumulative_budget_guard_applied=cumulative_budget_guard_applied,
+            debt_repayment_applied=debt_repayment_applied,
+            budget_control_reason=budget_control_reason,
+            required_guard_q=required_guard_q,
+            budget_eligible_safe_candidates=len(eligible),
+            repayment_headroom_q=repayment_headroom_q,
+            cumulative_work_ratio_after=cumulative_ratio_after,
+            cumulative_work_debt_after=cumulative_debt_after,
+            safe_q_min=min(safe_qs) if safe_qs else 0,
+            safe_q_max=max(safe_qs) if safe_qs else 0,
+            baseline_q_safe=baseline_q in safe_qs,
+            applied_q_safe=applied_q in safe_qs,
+            predicted_deadline_slack=latest_arrival_time - safe_finish,
             pre_accuracy_q=pre_accuracy_q, accuracy_priority_q=recommended_q,
             accuracy_floor_applied=accuracy_floor_applied,
             accuracy_boost_applied=accuracy_boost_applied,
@@ -490,10 +667,21 @@ class RUPWorkloadPolicy:
 
     def _finish_noop(self, client_id, q, previous_q, dispatch_time, expected, latest, reason, enabled):
         ratio_before, debt_before = self._budget_status()
+        cumulative_baseline_before = self._cumulative_baseline_q
+        cumulative_applied_before = self._cumulative_applied_q
+        cumulative_ratio_before = (
+            cumulative_applied_before / cumulative_baseline_before
+            if cumulative_baseline_before else 1.0
+        )
+        cumulative_debt_before = cumulative_baseline_before - cumulative_applied_before
         utility_raw, utility_norm, utility_conf, utility_state = self._utility_score(client_id)
         self._previous_q[client_id] = q
         self._budget.append((q, q))
+        self._cumulative_baseline_q += q
+        self._cumulative_applied_q += q
+        dispatch_id, client_dispatch_idx = self._next_dispatch_ids(client_id)
         return RUPDecision(
+            dispatch_id=dispatch_id, client_dispatch_idx=client_dispatch_idx,
             client_id=client_id, mode=self.config.mode, baseline_q=q, raw_state_q=q,
             trust_q=q, soft_q=q, utility_q=q, budget_q=q, recommended_q=q,
             applied_q=q, state_safe_feasible=True, num_safe_candidates=0,
@@ -506,6 +694,28 @@ class RUPWorkloadPolicy:
             progress_ema=utility_state.progress_ema, budget_ratio_before=ratio_before,
             budget_debt_before=debt_before,
             budget_adjustment=0, pre_accuracy_q=q, accuracy_priority_q=q,
+            unconstrained_q=q,
+            cumulative_baseline_before=cumulative_baseline_before,
+            cumulative_applied_before=cumulative_applied_before,
+            cumulative_work_ratio_before=cumulative_ratio_before,
+            cumulative_work_debt_before=cumulative_debt_before,
+            cumulative_work_debt_limit=int(math.floor(
+                (cumulative_baseline_before + q) * self.config.max_work_debt_ratio
+            )),
+            cumulative_budget_guard_applied=False,
+            debt_repayment_applied=False,
+            budget_control_reason="passthrough",
+            required_guard_q=0,
+            budget_eligible_safe_candidates=0,
+            repayment_headroom_q=0,
+            cumulative_work_ratio_after=(
+                self._cumulative_applied_q / self._cumulative_baseline_q
+            ),
+            cumulative_work_debt_after=(
+                self._cumulative_baseline_q - self._cumulative_applied_q
+            ),
+            safe_q_min=q, safe_q_max=q, baseline_q_safe=True,
+            applied_q_safe=True, predicted_deadline_slack=latest - dispatch_time,
             accuracy_floor_applied=False, accuracy_boost_applied=False,
             current_global_accuracy=self._current_global_accuracy,
             accuracy_boost_stage_active=(

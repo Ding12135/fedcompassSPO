@@ -6,6 +6,7 @@ import argparse
 import ast
 import csv
 import json
+import math
 import statistics
 from collections import Counter
 from pathlib import Path
@@ -32,6 +33,28 @@ def _mean(values, default=None):
 
 def _rate(count: int, total: int) -> float:
     return count / max(total, 1)
+
+
+def _cv(values: list[float]) -> float:
+    mean = _mean(values, 0.0)
+    return statistics.pstdev(values) / mean if values and mean else 0.0
+
+
+def _gini(values: list[float]) -> float:
+    ordered = sorted(max(0.0, value) for value in values)
+    total = sum(ordered)
+    n = len(ordered)
+    if not n or not total:
+        return 0.0
+    return sum((2 * i - n - 1) * value for i, value in enumerate(ordered, 1)) / (n * total)
+
+
+def _correlation(xs: list[float], ys: list[float]):
+    if len(xs) < 2 or len(ys) != len(xs):
+        return None
+    if len(set(xs)) < 2 or len(set(ys)) < 2:
+        return None
+    return statistics.correlation(xs, ys)
 
 
 def _float(row: dict, key: str, default: float = 0.0) -> float:
@@ -132,6 +155,28 @@ def summarize_run(directory: Path) -> dict:
             "mean_utility_multiplier": _mean([_float(x, "utility_normalized") for x in decisions]),
             "mean_utility_confidence": _mean([_float(x, "utility_confidence") for x in decisions]),
             "mean_budget_ratio_before": _mean([_float(x, "budget_ratio_before") for x in decisions]),
+            "cumulative_guard_applied_rate": _rate(sum(_int(x, "cumulative_budget_guard_applied") for x in decisions), len(decisions)),
+            "debt_repayment_applied_rate": _rate(sum(_int(x, "debt_repayment_applied") for x in decisions), len(decisions)),
+            "final_cumulative_work_ratio": _float(decisions[-1], "cumulative_work_ratio_after", 1.0),
+            "final_cumulative_work_debt": _float(decisions[-1], "cumulative_work_debt_after", 0.0),
+            "max_cumulative_work_debt": max((_float(x, "cumulative_work_debt_after") for x in decisions), default=0.0),
+            "mean_cumulative_work_ratio": _mean([_float(x, "cumulative_work_ratio_after", 1.0) for x in decisions]),
+            "baseline_q_safe_rate": _rate(sum(_int(x, "baseline_q_safe", 1) for x in decisions), len(decisions)),
+            "applied_q_safe_rate": _rate(sum(_int(x, "applied_q_safe", 1) for x in decisions), len(decisions)),
+            "mean_safe_candidate_span": _mean([
+                max(0.0, _float(x, "safe_q_max") - _float(x, "safe_q_min"))
+                for x in decisions
+            ]),
+            "mean_predicted_deadline_slack": _mean([_float(x, "predicted_deadline_slack") for x in decisions]),
+            "budget_control_reasons": dict(Counter(x.get("budget_control_reason") or "legacy" for x in decisions)),
+            "mean_budget_eligible_safe_candidates": _mean([_float(x, "budget_eligible_safe_candidates") for x in decisions]),
+            "mean_repayment_headroom_q": _mean([_float(x, "repayment_headroom_q") for x in decisions]),
+            "q_delta_utility_correlation": _correlation(
+                q_delta, [_float(x, "utility_normalized", 1.0) for x in decisions]
+            ),
+            "q_delta_deadline_slack_correlation": _correlation(
+                q_delta, [_float(x, "predicted_deadline_slack") for x in decisions]
+            ),
             "mean_residual_margin": _mean([_float(x, "residual_margin") for x in decisions]),
         }
     training_path = directory / "rup_training_trace.csv"
@@ -142,6 +187,65 @@ def summarize_run(directory: Path) -> dict:
             "non_finite": sum(_int(x, "finite") == 0 for x in training),
             "mean_prox_penalty": _mean([_float(x, "mean_prox_penalty") for x in training]),
             "positive_progress_rate": _rate(sum(_float(x, "loss_delta_per_step") > 0 for x in training), len(training)),
+        }
+    outcome_path = directory / "rup_outcome_trace.csv"
+    if outcome_path.exists():
+        outcomes = _rows(outcome_path)
+        errors = [_float(x, "prediction_error") for x in outcomes]
+        result["rup_outcomes"] = {
+            "completed_predicted_dispatches": len(outcomes),
+            "mean_prediction_error": _mean(errors),
+            "mean_absolute_prediction_error": _mean([abs(x) for x in errors]),
+            "p90_absolute_prediction_error": (
+                sorted(abs(x) for x in errors)[max(0, math.ceil(0.9 * len(errors)) - 1)]
+                if errors else None
+            ),
+            "safe_duration_exceeded_rate": _rate(sum(_int(x, "safe_duration_exceeded") for x in outcomes), len(outcomes)),
+            "deadline_miss_rate": _rate(sum(_int(x, "deadline_miss") for x in outcomes), len(outcomes)),
+            "prediction_error_q_correlation": _correlation(
+                errors, [_float(x, "applied_q") for x in outcomes]
+            ),
+        }
+    terminal_path = directory / "rup_terminal_state.json"
+    if terminal_path.exists():
+        result["rup_terminal"] = json.loads(terminal_path.read_text(encoding="utf-8"))
+
+    # Per-client allocation/completion/aggregation closure detects whether debt
+    # repayment is concentrated on a few non-IID silos or lost in the run tail.
+    client_ids = sorted({x["client_id"] for x in scheduler} | ({x["client_id"] for x in decisions} if rup_path.exists() else set()))
+    per_client = {}
+    aggregated_work = Counter()
+    aggregated_staleness = {}
+    for row in aggregations:
+        steps = ast.literal_eval(row["per_client_local_steps"])
+        stale = ast.literal_eval(row["per_client_staleness"])
+        for client_id, value in steps.items():
+            aggregated_work[client_id] += float(value)
+        for client_id, value in stale.items():
+            aggregated_staleness.setdefault(client_id, []).append(float(value))
+    for client_id in client_ids:
+        dispatched = [x for x in decisions if x["client_id"] == client_id] if rup_path.exists() else []
+        completed = [x for x in scheduler if x["client_id"] == client_id]
+        client_training = [x for x in training if x["client_id"] == client_id] if training_path.exists() else []
+        per_client[client_id] = {
+            "dispatched_updates": len(dispatched),
+            "dispatched_work": sum(_float(x, "applied_q") for x in dispatched),
+            "baseline_work": sum(_float(x, "baseline_q") for x in dispatched),
+            "completed_updates": len(completed),
+            "completed_work": sum(_float(x, "local_steps") for x in completed),
+            "aggregated_work": aggregated_work[client_id],
+            "late_rate": _rate(sum(_int(x, "late") for x in completed), len(completed)),
+            "mean_staleness": _mean(aggregated_staleness.get(client_id, [])),
+            "mean_utility": _mean([_float(x, "utility_normalized") for x in dispatched]),
+            "mean_loss_progress_per_step": _mean([_float(x, "loss_delta_per_step") for x in client_training]),
+        }
+    if per_client:
+        work = [x["dispatched_work"] for x in per_client.values()]
+        result["rup_client_fairness"] = {
+            "per_client": per_client,
+            "dispatched_work_cv": _cv(work),
+            "dispatched_work_gini": _gini(work),
+            "max_to_min_dispatched_work_ratio": max(work) / max(min(work), 1.0),
         }
     admission_path = directory / "group_admission_trace.csv"
     if admission_path.exists():
@@ -196,6 +300,7 @@ def _format_value(value):
 
 
 def _gate_summary(baseline: dict, rup: dict) -> dict:
+    work_ratio = rup["total_local_steps"] / max(baseline["total_local_steps"], 1)
     return {
         "tta65_beats_baseline": (
             rup.get("tta_65") is not None
@@ -205,6 +310,16 @@ def _gate_summary(baseline: dict, rup: dict) -> dict:
         "max_accuracy_at_least_baseline": rup["max_accuracy"] >= baseline["max_accuracy"],
         "max_accuracy_at_least_65": rup["max_accuracy"] >= 65.0,
         "late_rate_below_baseline": rup["late_rate"] < baseline["late_rate"],
+        "deadline_rate_below_baseline": rup["deadline_rate"] < baseline["deadline_rate"],
+        "final_accuracy_at_least_64_5": rup["final_accuracy"] >= 64.5,
+        "last10_std_not_worse": rup["last10_std"] <= baseline["last10_std"],
+        "work_ratio_in_0_99_1_02": 0.99 <= work_ratio <= 1.02,
+        "tta62_or_tta64_beats_baseline": any(
+            rup.get(f"tta_{threshold}") is not None
+            and baseline.get(f"tta_{threshold}") is not None
+            and rup[f"tta_{threshold}"] < baseline[f"tta_{threshold}"]
+            for threshold in (62, 64)
+        ),
         "auc_at_least_baseline": (
             rup["normalized_accuracy_time_auc"]
             >= baseline["normalized_accuracy_time_auc"]
@@ -255,6 +370,9 @@ def main() -> None:
         )
     lines.extend(["", "## RUP观测", "", "```json", json.dumps({
         "decision": rup.get("rup_observation", {}),
+        "outcome": rup.get("rup_outcomes", {}),
+        "terminal": rup.get("rup_terminal", {}),
+        "client_fairness": rup.get("rup_client_fairness", {}),
         "group_admission": rup.get("rup_group_admission", {}),
         "training": rup.get("rup_training", {}),
     }, indent=2, ensure_ascii=False), "```", ""])

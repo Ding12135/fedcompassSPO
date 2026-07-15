@@ -320,6 +320,11 @@ def run_experiment(args: argparse.Namespace) -> None:
                 row["profile_type"] = client_runtime.get_profile_type(row["client_id"])
                 trace.record_rup_decision(row)
 
+        if hasattr(controller, "pop_rup_outcomes"):
+            for row in controller.pop_rup_outcomes():
+                row["profile_type"] = client_runtime.get_profile_type(row["client_id"])
+                trace.record_rup_outcome(row)
+
         if hasattr(controller, "pop_state_q_traces"):
             for state_q in controller.pop_state_q_traces():
                 trace.record_state_q_decision(state_q)
@@ -567,6 +572,31 @@ def run_experiment(args: argparse.Namespace) -> None:
             shadow_report=problem_observer.build_shadow_report(),
             q_shadow_report=problem_observer.build_q_shadow_report(),
         )
+    if hasattr(controller, "get_rup_terminal_state"):
+        terminal = controller.get_rup_terminal_state()
+        completed_work = sum(int(row.get("local_steps", 0)) for row in trace.scheduler_rows)
+        aggregated_work = 0
+        aggregated_updates = 0
+        import json
+        for row in trace.aggregation_rows:
+            values = json.loads(row.get("per_client_local_steps", "{}"))
+            aggregated_work += sum(int(value) for value in values.values())
+            aggregated_updates += len(values)
+        terminal.update({
+            "completed_work": completed_work,
+            "aggregated_work": aggregated_work,
+            "completed_updates": len(trace.scheduler_rows),
+            "aggregated_updates": aggregated_updates,
+            "unfinished_dispatched_updates": max(
+                0, len(trace.rup_rows) - len(trace.scheduler_rows)
+            ),
+            "completed_not_aggregated_updates": max(
+                0, len(trace.scheduler_rows) - aggregated_updates
+            ),
+            "completed_to_dispatched_work_ratio": completed_work / max(terminal["dispatched_applied_work"], 1),
+            "aggregated_to_dispatched_work_ratio": aggregated_work / max(terminal["dispatched_applied_work"], 1),
+        })
+        trace.set_rup_terminal_state(terminal)
     trace.flush(experiment_config=experiment_config)
 
     if progress is not None:
@@ -634,6 +664,9 @@ def _rup_config_from_args(args) -> RUPConfig:
         budget_lower_ratio=getattr(args, "rup_budget_lower_ratio", 0.97),
         budget_upper_ratio=getattr(args, "rup_budget_upper_ratio", 1.03),
         budget_max_adjust_ratio=getattr(args, "rup_budget_max_adjust_ratio", 0.10),
+        cumulative_budget_guard_enabled=getattr(args, "rup_cumulative_budget_guard", "off") == "on",
+        max_work_debt_ratio=getattr(args, "rup_max_work_debt_ratio", 0.01),
+        debt_repay_utility_threshold=getattr(args, "rup_debt_repay_utility_threshold", 1.0),
         accuracy_priority_enabled=getattr(args, "rup_accuracy_priority", "on") == "on",
         accuracy_q_floor_ratio=getattr(args, "rup_accuracy_q_floor_ratio", 1.0),
         accuracy_q_boost_ratio=getattr(args, "rup_accuracy_q_boost_ratio", 0.05),
@@ -857,6 +890,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rup_budget_lower_ratio", type=float, default=0.97)
     parser.add_argument("--rup_budget_upper_ratio", type=float, default=1.03)
     parser.add_argument("--rup_budget_max_adjust_ratio", type=float, default=0.10)
+    parser.add_argument("--rup_cumulative_budget_guard", choices=["on", "off"], default="off")
+    parser.add_argument("--rup_max_work_debt_ratio", type=float, default=0.01)
+    parser.add_argument("--rup_debt_repay_utility_threshold", type=float, default=1.0)
     parser.add_argument("--rup_accuracy_priority", choices=["on", "off"], default="on")
     parser.add_argument("--rup_accuracy_q_floor_ratio", type=float, default=1.0)
     parser.add_argument("--rup_accuracy_q_boost_ratio", type=float, default=0.05)

@@ -45,7 +45,7 @@ class RUPWorkloadPolicyTest(unittest.TestCase):
         self.assertEqual(result.applied_q, 100)
 
     def test_group_admission_mode_is_independently_configurable(self):
-        self.assertEqual(RUPConfig().group_admission_mode, "apply")
+        self.assertEqual(RUPConfig().group_admission_mode, "conservative")
         self.assertEqual(
             RUPConfig(group_admission_mode="off").group_admission_mode, "off"
         )
@@ -110,6 +110,76 @@ class RUPWorkloadPolicyTest(unittest.TestCase):
         result = self._decide(no_progress)
         self.assertEqual(result.utility_confidence, 0.0)
         self.assertEqual(result.utility_normalized, 1.0)
+
+    def test_cumulative_guard_bounds_training_debt_after_final_selection(self):
+        policy = RUPWorkloadPolicy(
+            _LinearPredictor(),
+            RUPConfig(
+                soft_boundary_enabled=False,
+                utility_enabled=False,
+                budget_enabled=False,
+                accuracy_priority_enabled=False,
+                cumulative_budget_guard_enabled=True,
+                max_work_debt_ratio=0.01,
+            ),
+        )
+        result = self._decide(policy, baseline=150)
+        self.assertTrue(result.cumulative_budget_guard_applied)
+        self.assertGreaterEqual(result.applied_q, 149)
+        self.assertLessEqual(
+            result.cumulative_work_debt_after,
+            result.cumulative_work_debt_limit,
+        )
+
+    def test_cumulative_guard_runs_after_q_smoothing(self):
+        policy = RUPWorkloadPolicy(
+            _LinearPredictor(),
+            RUPConfig(
+                soft_boundary_enabled=False,
+                utility_enabled=False,
+                budget_enabled=False,
+                accuracy_priority_enabled=False,
+                q_smoothness_enabled=True,
+                cumulative_budget_guard_enabled=True,
+                max_work_debt_ratio=0.0,
+            ),
+        )
+        policy._previous_q["client_0"] = 40
+        result = self._decide(policy, baseline=100)
+        self.assertTrue(result.q_smooth_applied)
+        self.assertEqual(result.applied_q, 100)
+        self.assertEqual(result.cumulative_work_debt_after, 0)
+
+    def test_realized_outcome_closes_prediction_loop(self):
+        policy = RUPWorkloadPolicy(
+            _LinearPredictor(),
+            RUPConfig(accuracy_priority_enabled=False),
+        )
+        decision = self._decide(policy, baseline=100)
+        policy.observe_upload(
+            "client_0", 16.0, upload_time=16.0, late=True,
+        )
+        outcomes = policy.pop_outcomes()
+        self.assertEqual(len(outcomes), 1)
+        self.assertEqual(outcomes[0]["dispatch_id"], decision.dispatch_id)
+        self.assertAlmostEqual(
+            outcomes[0]["prediction_error"],
+            16.0 - outcomes[0]["predicted_duration"],
+        )
+        self.assertEqual(outcomes[0]["deadline_miss"], 1)
+        self.assertEqual(policy.pop_outcomes(), [])
+
+    def test_terminal_state_reports_pending_dispatches_and_work(self):
+        policy = RUPWorkloadPolicy(
+            _LinearPredictor(),
+            RUPConfig(accuracy_priority_enabled=False),
+        )
+        decision = self._decide(policy, baseline=100)
+        terminal = policy.terminal_state()
+        self.assertEqual(terminal["dispatched_applied_work"], decision.applied_q)
+        self.assertEqual(terminal["pending_dispatches"], 1)
+        policy.observe_upload("client_0", 15.0)
+        self.assertEqual(policy.terminal_state()["pending_dispatches"], 0)
 
 
 if __name__ == "__main__":
