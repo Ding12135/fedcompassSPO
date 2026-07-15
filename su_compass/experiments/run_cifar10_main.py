@@ -11,6 +11,11 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_METHODS = ("fedcompass", "q_only", "q_and_group")
 DEFAULT_SEEDS = (2026, 2027, 2028)
+# 2026-07-13 在云端 NVIDIA GeForce RTX 4090 上实测：40 local steps
+# 中位耗时 0.617422 秒，ResNet-18 state_dict 为 42.662056 MiB。
+RTX4090_BASE_STEP_TIME = 0.015435538
+RTX4090_MODEL_SIZE_MB = 42.662056
+RTX4090_UPDATE_SIZE_MB = 42.662056
 
 
 def parse_args() -> argparse.Namespace:
@@ -29,8 +34,18 @@ def parse_args() -> argparse.Namespace:
         default="su_compass/config/virtual_fedcompass_cifar10_8.yaml",
     )
     parser.add_argument("--client_config", default="examples/config/client_cifar10.yaml")
-    parser.add_argument("--base_step_time", type=float, default=0.0703)
-    parser.add_argument("--model_size_mb", type=float, default=42.66)
+    parser.add_argument(
+        "--base_step_time", type=float, default=RTX4090_BASE_STEP_TIME,
+        help="RTX 4090 实测每个 local step 耗时（秒）",
+    )
+    parser.add_argument(
+        "--model_size_mb", type=float, default=RTX4090_MODEL_SIZE_MB,
+        help="ResNet-18 下发模型大小（MiB）",
+    )
+    parser.add_argument(
+        "--update_size_mb", type=float, default=RTX4090_UPDATE_SIZE_MB,
+        help="ResNet-18 上传更新大小（MiB）",
+    )
     parser.add_argument("--force", action="store_true")
     parser.add_argument("--no_progress", action="store_true")
     return parser.parse_args()
@@ -59,7 +74,7 @@ def build_command(args: argparse.Namespace, method: str, seed: int, output: Path
         "--model_size_mb",
         str(args.model_size_mb),
         "--update_size_mb",
-        str(args.model_size_mb),
+        str(args.update_size_mb),
         "--output_dir",
         str(output),
         "--algorithm_variant",

@@ -24,6 +24,7 @@ from su_compass.runtime.state import RuntimeStateTracker, ClientRuntimeState
 from su_compass.runtime.virtual_runtime import VirtualRuntimeModel, VirtualRoundResult
 
 from .event import VirtualEvent, EventType
+from .training import RUPTrainingAdapter
 
 
 class VirtualClientRuntime:
@@ -54,6 +55,7 @@ class VirtualClientRuntime:
         window_size: int = 20,
         qmin: int = 1,
         qmax: int = 200,
+        training_adapter: Optional[RUPTrainingAdapter] = None,
     ) -> None:
         """初始化桥接器。
 
@@ -71,6 +73,7 @@ class VirtualClientRuntime:
         self.profiles = profiles  # {client_id: (profile_type, profile)}，profile_type 只用于 trace 标注
         self.qmin = qmin          # 传给 report，便于分析 Q 是否被 FedCompass/Oort 压到最小值
         self.qmax = qmax          # 传给 report，便于分析 Q 是否仍处在最大训练步数
+        self.training_adapter = training_adapter
 
         # 虚拟运行时间模型——全部客户端共享同一实例
         self.runtime_model = VirtualRuntimeModel(
@@ -129,7 +132,13 @@ class VirtualClientRuntime:
         # ──── 步骤 1-3：真实训练 ────
         # 注意这里不会 sleep，也不会按虚拟时间等待；真实训练只是为了拿到模型更新。
         client_agent.trainer.train_configs.num_local_steps = local_steps  # 设置本轮 Q
-        client_agent.train()                                             # GPU 真实训练
+        training_observation = None
+        if self.training_adapter is None:
+            client_agent.train()                                         # GPU 真实训练
+        else:
+            training_observation = self.training_adapter.train(
+                client_agent, client_id, local_steps,
+            )
         local_model = client_agent.get_parameters()                      # 取出本地模型
         non_finite = [
             name for name, value in local_model.items()
@@ -170,6 +179,7 @@ class VirtualClientRuntime:
                 "report": result.report,                # ClientRoundReport
                 "runtime_state": state,                 # 更新后的运行状态快照
                 "profile_type": self.profiles[client_id][0],  # 画像类型名称
+                "rup_training_observation": training_observation,
             },
         )
 

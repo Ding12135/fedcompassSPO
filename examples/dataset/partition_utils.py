@@ -165,6 +165,7 @@ def dirichlet_noniid_partition(
     output_filename: Optional[str] = None,
     alpha1: float = 8.0,
     alpha2: float = 0.5,
+    dirichlet_mode: str = "legacy_two_level",
     seed: int = 42,
     **kwargs,
 ) -> List[Dataset]:
@@ -181,34 +182,55 @@ def dirichlet_noniid_partition(
 
     for label in labels:
         np.random.shuffle(label_indices[label])
-
-    p1 = [1 / num_clients for _ in range(num_clients)]
-    p2 = [len(label_indices[label]) for label in labels]
-    p2 = [p / sum(p2) for p in p2]
-    q1 = [alpha1 * i for i in p1]
-    q2 = [alpha2 * i for i in p2]
-
-    weights = np.random.dirichlet(q1)
-    individuals = np.random.dirichlet(q2, num_clients)
     classes_samples = [len(label_indices[label]) for label in labels]
 
-    normalized_portions = np.zeros(individuals.shape)
-    for i in range(num_clients):
-        for j in range(len(classes_samples)):
-            normalized_portions[i][j] = weights[i] * individuals[i][j] / np.dot(
-                weights, individuals.transpose()[j]
-            )
+    if dirichlet_mode == "standard":
+        if alpha2 <= 0:
+            raise ValueError("alpha2 must be positive for standard Dirichlet partitioning")
+        # Conventional label-wise Dirichlet partition: for every class, draw
+        # client proportions from Dirichlet(alpha).  Thus alpha2=0.5 really
+        # means concentration 0.5 per client, matching the common FL protocol.
+        sample_matrix = np.zeros((len(labels), num_clients), dtype=np.int64)
+        for row, label in enumerate(labels):
+            proportions = np.random.dirichlet([alpha2] * num_clients)
+            counts = np.floor(proportions * len(label_indices[label])).astype(np.int64)
+            remainder = len(label_indices[label]) - int(counts.sum())
+            if remainder:
+                fractional = proportions * len(label_indices[label]) - counts
+                for client_idx in np.argsort(-fractional)[:remainder]:
+                    counts[client_idx] += 1
+            sample_matrix[row] = counts
+    elif dirichlet_mode != "legacy_two_level":
+        raise ValueError(
+            "dirichlet_mode must be 'legacy_two_level' or 'standard'"
+        )
 
-    sample_matrix = np.multiply(
-        np.array([classes_samples] * num_clients), normalized_portions
-    ).transpose()
+    if dirichlet_mode == "legacy_two_level":
+        p1 = [1 / num_clients for _ in range(num_clients)]
+        p2 = [len(label_indices[label]) for label in labels]
+        p2 = [p / sum(p2) for p in p2]
+        q1 = [alpha1 * i for i in p1]
+        q2 = [alpha2 * i for i in p2]
 
-    for i in range(len(classes_samples)):
-        total = 0
-        for j in range(num_clients - 1):
-            sample_matrix[i][j] = int(sample_matrix[i][j])
-            total += sample_matrix[i][j]
-        sample_matrix[i][num_clients - 1] = classes_samples[i] - total
+        weights = np.random.dirichlet(q1)
+        individuals = np.random.dirichlet(q2, num_clients)
+        normalized_portions = np.zeros(individuals.shape)
+        for i in range(num_clients):
+            for j in range(len(classes_samples)):
+                normalized_portions[i][j] = weights[i] * individuals[i][j] / np.dot(
+                    weights, individuals.transpose()[j]
+                )
+
+        sample_matrix = np.multiply(
+            np.array([classes_samples] * num_clients), normalized_portions
+        ).transpose()
+
+        for i in range(len(classes_samples)):
+            total = 0
+            for j in range(num_clients - 1):
+                sample_matrix[i][j] = int(sample_matrix[i][j])
+                total += sample_matrix[i][j]
+            sample_matrix[i][num_clients - 1] = classes_samples[i] - total
 
     if visualization:
         plot_distribution(

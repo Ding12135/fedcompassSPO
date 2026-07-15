@@ -1,5 +1,8 @@
 # 云端 CIFAR-10 收敛实验说明（FedCompass vs q_only）
 
+> **口径提示（2026-07-14）：** 本文中的历史运行流程继续保留；正式数据划分、论文对齐和三方法公平比较要求以
+> [`../cifar说明/数据划分与公平对比规范.md`](../cifar说明/数据划分与公平对比规范.md) 为准。
+
 本文档面向**云端 Agent / 远程执行环境**，说明如何在云 GPU 上跑通 CIFAR-10 主实验、判断是否收敛、如何分析结果，以及后续优化调优方向。
 
 ---
@@ -123,7 +126,18 @@ export BASE_STEP=<云上测得的 base_step_time>
 export MODEL_MB=<云上测得的 model_size_mb>
 ```
 
-参考值（RTX 3060 Laptop，仅供对照）：`base_step_time≈0.0703`，`model_size_mb≈42.66`。
+当前正式云端环境已于 2026-07-13 在 **NVIDIA GeForce RTX 4090** 上完成校准：
+
+```text
+base_step_time = 0.015435538
+model_size_mb  = 42.662056
+update_size_mb = 42.662056
+40 steps 中位耗时 = 0.617422 秒
+```
+
+上述数值已固化为 `run_cifar10_main.py` 的 CIFAR 默认值。在同一台
+RTX 4090 上运行主实验时可以不再显式传入这三个参数；更换 GPU
+或修改模型后必须重新校准。
 
 **第一阶段完成标准：** 已输出 `BASE_STEP` 和 `MODEL_MB`，并确认单次 round-40 训练可稳定完成、无 NaN。
 

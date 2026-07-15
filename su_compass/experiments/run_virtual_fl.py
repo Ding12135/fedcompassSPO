@@ -25,6 +25,7 @@ import sys
 import os
 import random
 import time
+from dataclasses import asdict
 from typing import Dict, List, Any, Optional
 
 import numpy as np
@@ -61,7 +62,12 @@ from su_compass.virtual.algorithms.fedavg import VirtualFedAvgController
 from su_compass.virtual.algorithms.fedasync import VirtualFedAsyncController
 from su_compass.virtual.algorithms.fedcompass import VirtualFedCompassController
 from su_compass.virtual.algorithms.oort_compass import VirtualOortCompassController
+from su_compass.virtual.algorithms.state_compass import VirtualStateCompassController
+from su_compass.virtual.algorithms.rup_compass import VirtualRUPCompassController
 from su_compass.virtual.algorithms.utility import OortConfig
+from su_compass.virtual.training import RUPTrainingAdapter
+from su_compass.scheduling.policies import RUPConfig
+from su_compass.diagnostics import FedCompassProblemObserver
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -124,6 +130,12 @@ def run_experiment(args: argparse.Namespace) -> None:
         run_lines.append(
             f"Oort λ    comm={args.oort_lambda_comm} late={args.oort_lambda_late} "
             f"var={args.oort_lambda_var} avail={args.oort_lambda_avail}"
+        )
+    if args.algorithm == "rup_compass":
+        run_lines.append(
+            f"RUP mode   {args.rup_mode}; state={args.rup_state} trust={args.rup_trust} "
+            f"soft={args.rup_soft_boundary} utility={args.rup_utility} "
+            f"budget={args.rup_budget} prox={args.rup_prox}"
         )
 
     hardware = gather_hardware_info(train_device=train_device)
@@ -192,6 +204,15 @@ def run_experiment(args: argparse.Namespace) -> None:
     qmin = sched_kwargs["min_local_steps"]
     qmax = sched_kwargs["max_local_steps"]
 
+    rup_training_adapter = None
+    if args.algorithm == "rup_compass":
+        rup_training_adapter = RUPTrainingAdapter(
+            utility_enabled=(args.rup_mode != "off" and args.rup_utility == "on"),
+            # Shadow must leave both scheduling and optimization unchanged.
+            prox_enabled=(args.rup_mode == "apply" and args.rup_prox == "on"),
+            prox_mu=args.rup_prox_mu,
+            utility_eval_batches=args.rup_utility_eval_batches,
+        )
     client_runtime = VirtualClientRuntime(
         profiles=profiles,
         base_step_time=args.base_step_time,
@@ -202,6 +223,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         window_size=args.window_size,
         qmin=qmin,
         qmax=qmax,
+        training_adapter=rup_training_adapter,
     )
 
     # ──────────── 步骤 5：创建算法控制器 ────────────────
@@ -212,6 +234,11 @@ def run_experiment(args: argparse.Namespace) -> None:
         output_dir=args.output_dir,
         algorithm=args.algorithm,
         algorithm_variant=getattr(args, "algorithm_variant", "") or args.algorithm,
+    )
+    # FedCompass 问题观测器只记录真实决策与结果，不参与 controller 的任何计算。
+    # Oort 变体暂不启用该报告，避免把受干预后的决策误写成 baseline 问题证据。
+    problem_observer = (
+        FedCompassProblemObserver() if args.algorithm == "fedcompass" else None
     )
     eval_agent = client_agents[client_ids[0]]  # 用 client_0 的 val_dataloader 做全局评估
 
@@ -256,6 +283,8 @@ def run_experiment(args: argparse.Namespace) -> None:
                         test_loss=loss,
                         num_val_samples=n_samples,
                     )
+                    if hasattr(controller, "update_global_accuracy"):
+                        controller.update_global_accuracy(acc)
                     nonlocal last_accuracy
                     last_accuracy = acc
                     if progress is not None:
@@ -279,10 +308,66 @@ def run_experiment(args: argparse.Namespace) -> None:
         if hasattr(controller, "pop_dispatch_decision_traces"):
             for dd in controller.pop_dispatch_decision_traces():
                 trace.record_dispatch_decision(dd)
+                if problem_observer is not None:
+                    problem_observer.record_dispatch(dd)
 
         if hasattr(controller, "pop_oort_traces"):
             for ot in controller.pop_oort_traces():
                 trace.record_oort_decision(ot)
+
+        if hasattr(controller, "pop_rup_traces"):
+            for row in controller.pop_rup_traces():
+                row["profile_type"] = client_runtime.get_profile_type(row["client_id"])
+                trace.record_rup_decision(row)
+
+        if hasattr(controller, "pop_state_q_traces"):
+            for state_q in controller.pop_state_q_traces():
+                trace.record_state_q_decision(state_q)
+
+        # RCP-GS当前处于Group Shadow验证阶段：控制器只产生候选与推荐事实，
+        # TraceWriter独立落盘，不把推荐结果反馈给FedCompass分组状态。
+        if hasattr(controller, "pop_group_candidate_traces"):
+            for candidate in controller.pop_group_candidate_traces():
+                trace.record_group_candidate_shadow(candidate)
+
+        if hasattr(controller, "pop_group_recommendation_traces"):
+            for recommendation in controller.pop_group_recommendation_traces():
+                trace.record_group_recommendation_shadow(recommendation)
+
+        if hasattr(controller, "pop_group_admission_traces"):
+            for admission in controller.pop_group_admission_traces():
+                trace.record_group_admission(admission)
+
+        if hasattr(controller, "pop_all_group_feasibility_traces"):
+            for candidate in controller.pop_all_group_feasibility_traces():
+                trace.record_all_group_feasibility(candidate)
+
+        if hasattr(controller, "pop_all_group_recommendation_traces"):
+            for recommendation in controller.pop_all_group_recommendation_traces():
+                trace.record_all_group_recommendation(recommendation)
+
+        if hasattr(controller, "pop_group_creation_counterfactual_traces"):
+            for result in controller.pop_group_creation_counterfactual_traces():
+                trace.record_group_creation_counterfactual(result)
+
+        if hasattr(controller, "pop_state_group_creation_q_traces"):
+            for result in controller.pop_state_group_creation_q_traces():
+                trace.record_state_group_creation_q(result)
+
+        if hasattr(controller, "pop_state_group_window_traces"):
+            for result in controller.pop_state_group_window_traces():
+                trace.record_state_group_window(result)
+
+        if hasattr(controller, "pop_state_window_admission_traces"):
+            for result in controller.pop_state_window_admission_traces():
+                trace.record_state_window_admission(result)
+
+        if hasattr(controller, "pop_communication_tail_risk_traces"):
+            for result in controller.pop_communication_tail_risk_traces():
+                trace.record_communication_tail_risk(result)
+        if hasattr(controller, "pop_communication_robust_q_traces"):
+            for result in controller.pop_communication_robust_q_traces():
+                trace.record_communication_robust_q(result)
 
     while not controller.training_finished():
         # ──── A. 真实训练阶段：处理待派发任务 ────
@@ -308,6 +393,13 @@ def run_experiment(args: argparse.Namespace) -> None:
             )
             event.payload["client_round_idx"] = client_round_idx  # 供 upload 处理后 enrich round_reports
 
+            observation = event.payload.get("rup_training_observation")
+            if observation is not None:
+                observation_row = observation.to_dict()
+                observation_row["client_round_idx"] = client_round_idx
+                observation_row["finite"] = int(observation.finite)
+                trace.record_rup_training(observation_row)
+
             event_queue.push(event)
 
             # 训练完成即写 round_reports / state_trace（upload 字段稍后 enrich）
@@ -327,6 +419,24 @@ def run_experiment(args: argparse.Namespace) -> None:
         virtual_now = event.time
 
         if event.event_type == EventType.CLIENT_UPLOAD:
+            if problem_observer is not None:
+                # 虚拟训练结果在事件入队前已经计算完成，但只有CLIENT_UPLOAD真正
+                # 到达当前虚拟时间后，服务端才能合法看到它。必须在这里而不是训练
+                # 调用返回时更新observer，否则会提前看到尚未上传客户端的未来状态。
+                observed_report = event.payload["report"]
+                observed_state = event.payload.get("runtime_state")
+                problem_observer.observe_round(
+                    client_id=event.client_id,
+                    client_round_idx=event.payload.get("client_round_idx", 0),
+                    profile_type=event.payload.get("profile_type", ""),
+                    report=observed_report,
+                    # ClientRoundReport已经包含诊断所需的全部耗时分量，可直接作为
+                    # result读取，避免把仅用于观测的对象额外塞入事件payload。
+                    result=observed_report,
+                )
+                # 先完成当前轮误差比较，再公开当前状态。随后控制器产生的下一轮
+                # dispatch decision才允许使用这份状态，保证严格的时间因果顺序。
+                problem_observer.update_runtime_state(event.client_id, observed_state)
             new_events = controller.on_client_upload(event, virtual_now)
 
             report = event.payload["report"]
@@ -402,8 +512,33 @@ def run_experiment(args: argparse.Namespace) -> None:
         "seed": args.seed,
         "server_config": args.server_config,
         "client_config": args.client_config,
+        "all_group_feasibility_mode": args.all_group_feasibility_mode,
+        "group_creation_counterfactual_mode": args.group_creation_counterfactual_mode,
+        "state_group_creation_q_mode": args.state_group_creation_q_mode,
+        "state_group_window_mode": args.state_group_window_mode,
+        "state_window_admission_mode": args.state_window_admission_mode,
+        "communication_tail_risk_mode": args.communication_tail_risk_mode,
+        "communication_robust_q_mode": args.communication_robust_q_mode,
         "hardware": hardware.to_dict(),
         "algorithm_variant": variant,
+        # Persist the resolved training base, not only the YAML path.  This is
+        # essential when comparing convergence runs because optimizer, data
+        # partition and BN-buffer behavior can otherwise differ silently.
+        "resolved_training_base": {
+            "train_configs": OmegaConf.to_container(
+                server_config.client_configs.train_configs, resolve=True
+            ),
+            "dataset_kwargs": OmegaConf.to_container(
+                cfg.data_configs.dataset_kwargs, resolve=True
+            ),
+            "aggregator_kwargs": (
+                OmegaConf.to_container(
+                    server_config.server_configs.aggregator_kwargs, resolve=True
+                )
+                if hasattr(server_config.server_configs, "aggregator_kwargs")
+                else {}
+            ),
+        },
     }
     if args.algorithm == "oort_compass":
         experiment_config.update({
@@ -415,6 +550,23 @@ def run_experiment(args: argparse.Namespace) -> None:
             "oort_risk_threshold": args.oort_risk_threshold,
             "oort_slack_min_ratio": args.oort_slack_min_ratio,
         })
+    if args.algorithm == "state_compass":
+        experiment_config["group_admission_mode"] = args.group_admission_mode
+    if args.algorithm == "rup_compass":
+        experiment_config["rup_config"] = asdict(_rup_config_from_args(args))
+        experiment_config["rup_config"].update({
+            "prox_requested": args.rup_prox == "on",
+            "prox_enabled": args.rup_mode == "apply" and args.rup_prox == "on",
+            "prox_mu": args.rup_prox_mu,
+            "utility_eval_batches": args.rup_utility_eval_batches,
+        })
+    if problem_observer is not None:
+        trace.set_fedcompass_problem_diagnostics(
+            prediction_rows=problem_observer.prediction_rows(),
+            report=problem_observer.build_report(trace.group_rows),
+            shadow_report=problem_observer.build_shadow_report(),
+            q_shadow_report=problem_observer.build_q_shadow_report(),
+        )
     trace.flush(experiment_config=experiment_config)
 
     if progress is not None:
@@ -451,6 +603,50 @@ def run_experiment(args: argparse.Namespace) -> None:
 #  工厂函数
 # ═══════════════════════════════════════════════════════════════
 
+def _rup_config_from_args(args) -> RUPConfig:
+    """Build the complete policy config from CLI/programmatic arguments."""
+    return RUPConfig(
+        mode=getattr(args, "rup_mode", "apply"),
+        group_admission_mode=getattr(args, "rup_group_admission", "conservative"),
+        group_admission_min_group_size=getattr(args, "rup_group_admission_min_group_size", 3),
+        group_admission_late_slack_ratio=getattr(args, "rup_group_admission_late_slack_ratio", 0.05),
+        state_enabled=getattr(args, "rup_state", "on") == "on",
+        residual_risk_enabled=getattr(args, "rup_residual_risk", "on") == "on",
+        trust_region_enabled=getattr(args, "rup_trust", "on") == "on",
+        soft_boundary_enabled=getattr(args, "rup_soft_boundary", "on") == "on",
+        utility_enabled=getattr(args, "rup_utility", "on") == "on",
+        budget_enabled=getattr(args, "rup_budget", "on") == "on",
+        state_warmup_reports=getattr(args, "rup_state_warmup_reports", 3),
+        residual_min_reports=getattr(args, "rup_residual_min_reports", 5),
+        residual_window=getattr(args, "rup_residual_window", 20),
+        residual_quantile=getattr(args, "rup_residual_quantile", 0.80),
+        trust_fc_lower=getattr(args, "rup_trust_fc_lower", 0.80),
+        trust_fc_upper=getattr(args, "rup_trust_fc_upper", 1.20),
+        trust_prev_lower=getattr(args, "rup_trust_prev_lower", 0.75),
+        trust_prev_upper=getattr(args, "rup_trust_prev_upper", 1.25),
+        soft_qmin=getattr(args, "rup_soft_qmin", 50),
+        soft_qmax=getattr(args, "rup_soft_qmax", 180),
+        utility_beta=getattr(args, "rup_utility_beta", 0.20),
+        utility_min_reports=getattr(args, "rup_utility_min_reports", 5),
+        utility_lower=getattr(args, "rup_utility_lower", 0.90),
+        utility_upper=getattr(args, "rup_utility_upper", 1.10),
+        budget_window=getattr(args, "rup_budget_window", 50),
+        budget_lower_ratio=getattr(args, "rup_budget_lower_ratio", 0.97),
+        budget_upper_ratio=getattr(args, "rup_budget_upper_ratio", 1.03),
+        budget_max_adjust_ratio=getattr(args, "rup_budget_max_adjust_ratio", 0.10),
+        accuracy_priority_enabled=getattr(args, "rup_accuracy_priority", "on") == "on",
+        accuracy_q_floor_ratio=getattr(args, "rup_accuracy_q_floor_ratio", 1.0),
+        accuracy_q_boost_ratio=getattr(args, "rup_accuracy_q_boost_ratio", 0.05),
+        accuracy_q_boost_min_confidence=getattr(args, "rup_accuracy_q_boost_min_confidence", 0.5),
+        accuracy_q_boost_start_accuracy=getattr(args, "rup_accuracy_q_boost_start_accuracy", 50.0),
+        risk_gated_floor_enabled=getattr(args, "rup_risk_gated_floor", "off") == "on",
+        risk_gated_floor_min_safe_candidates=getattr(args, "rup_risk_gated_floor_min_safe_candidates", 10),
+        risk_gated_floor_slack_ratio=getattr(args, "rup_risk_gated_floor_slack_ratio", 0.05),
+        q_smoothness_enabled=getattr(args, "rup_q_smoothness", "off") == "on",
+        q_smooth_max_increase_ratio=getattr(args, "rup_q_smooth_max_increase_ratio", 0.10),
+        q_smooth_max_decrease_ratio=getattr(args, "rup_q_smooth_max_decrease_ratio", 0.20),
+    )
+
 def _create_aggregator(algorithm: str, model, server_config) -> Any:
     """根据算法名创建对应的 APPFL 聚合器。
 
@@ -470,7 +666,7 @@ def _create_aggregator(algorithm: str, model, server_config) -> Any:
         return FedAvgAggregator(model=copy.deepcopy(model), aggregator_config=agg_config, logger=logger)
     elif algorithm == "fedasync":
         return FedAsyncAggregator(model=copy.deepcopy(model), aggregator_config=agg_config, logger=logger)
-    elif algorithm in ("fedcompass", "oort_compass"):
+    elif algorithm in ("fedcompass", "oort_compass", "state_compass", "rup_compass"):
         # oort_compass 复用 FedCompass 聚合器，仅调度层引入 Oort 效用
         return FedCompassAggregator(model=copy.deepcopy(model), aggregator_config=agg_config, logger=logger)
     else:
@@ -504,6 +700,35 @@ def _create_controller(args, aggregator, sched_kwargs):
             speed_momentum=sched_kwargs.get("speed_momentum", 0.9),
             latest_time_factor=sched_kwargs.get("latest_time_factor", 1.2),
             num_global_epochs=args.num_global_epochs,
+        )
+    elif args.algorithm == "state_compass":
+        return VirtualStateCompassController(
+            aggregator=aggregator,
+            num_clients=args.num_clients,
+            min_local_steps=sched_kwargs.get("min_local_steps", args.min_local_steps),
+            max_local_steps=sched_kwargs.get("max_local_steps", args.max_local_steps),
+            speed_momentum=sched_kwargs.get("speed_momentum", 0.9),
+            latest_time_factor=sched_kwargs.get("latest_time_factor", 1.2),
+            num_global_epochs=args.num_global_epochs,
+            group_admission_mode=args.group_admission_mode,
+            all_group_feasibility_mode=args.all_group_feasibility_mode,
+            group_creation_counterfactual_mode=args.group_creation_counterfactual_mode,
+            state_group_creation_q_mode=args.state_group_creation_q_mode,
+            state_group_window_mode=args.state_group_window_mode,
+            state_window_admission_mode=args.state_window_admission_mode,
+            communication_tail_risk_mode=args.communication_tail_risk_mode,
+            communication_robust_q_mode=args.communication_robust_q_mode,
+        )
+    elif args.algorithm == "rup_compass":
+        return VirtualRUPCompassController(
+            aggregator=aggregator,
+            num_clients=args.num_clients,
+            min_local_steps=sched_kwargs.get("min_local_steps", args.min_local_steps),
+            max_local_steps=sched_kwargs.get("max_local_steps", args.max_local_steps),
+            speed_momentum=sched_kwargs.get("speed_momentum", 0.9),
+            latest_time_factor=sched_kwargs.get("latest_time_factor", 1.2),
+            num_global_epochs=args.num_global_epochs,
+            rup_config=_rup_config_from_args(args),
         )
     elif args.algorithm == "oort_compass":
         # 与 FedCompass 共享全部调度参数，额外注入 Oort 配置（mode + λ 权重）
@@ -551,7 +776,7 @@ def parse_args() -> argparse.Namespace:
 
     # ──── 核心参数 ────
     parser.add_argument("--algorithm", type=str, default="fedcompass",
-                        choices=["fedavg", "fedasync", "fedcompass", "oort_compass"],
+                        choices=["fedavg", "fedasync", "fedcompass", "oort_compass", "state_compass", "rup_compass"],
                         help="联邦学习算法")
     parser.add_argument("--server_config", type=str,
                         default="examples/config/server_fedcompass_paper_mnist8.yaml",
@@ -571,6 +796,81 @@ def parse_args() -> argparse.Namespace:
                         help="最大本地训练步数 Qmax")
     parser.add_argument("--latest_time_factor", type=float, default=None,
                         help="FedCompass 迟到阈值系数 λ；默认读 server yaml")
+    parser.add_argument("--group_admission_mode", type=str, default="shadow",
+                        choices=["shadow", "apply"],
+                        help="StateCompass风险约束入组：shadow只记录；apply在无安全Q时改走原始新建组")
+    parser.add_argument("--all_group_feasibility_mode", type=str, default="off",
+                        choices=["off", "shadow"],
+                        help="全量已有组状态可行性观测：off关闭；shadow只读枚举，不改变调度")
+    parser.add_argument("--group_creation_counterfactual_mode", type=str, default="off",
+                        choices=["off", "shadow"],
+                        help="原始新建组反事实：off关闭；shadow只读复算，不改变真实调度")
+    parser.add_argument("--state_group_creation_q_mode", type=str, default="off",
+                        choices=["off", "shadow"],
+                        help="状态感知新组Q枚举：off关闭；shadow只读建议，不改变真实建组")
+    parser.add_argument("--state_group_window_mode", type=str, default="off",
+                        choices=["off", "shadow"],
+                        help="固定原始新组Q的状态时间窗：off关闭；shadow只读比较")
+    parser.add_argument("--state_window_admission_mode", type=str, default="off",
+                        choices=["off", "shadow", "apply"],
+                        help="状态时间窗组合准入Gate：shadow只记录；apply仅执行安全状态新组")
+    parser.add_argument("--communication_tail_risk_mode", type=str, default="off",
+                        choices=["off", "shadow"],
+                        help="通信尾部风险校准：off关闭；shadow只记录，不改变Admission")
+    parser.add_argument("--communication_robust_q_mode", type=str, default="off",
+                        choices=["off", "shadow"],
+                        help="固定状态组时间窗的通信稳健Q：off关闭；shadow只建议")
+
+    # ──── RUP-Compass 可插拔层（仅 --algorithm rup_compass 生效）────
+    parser.add_argument("--rup_mode", choices=["off", "shadow", "apply"], default="apply")
+    parser.add_argument("--rup_state", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_residual_risk", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_trust", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_soft_boundary", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_utility", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_budget", choices=["on", "off"], default="on")
+    parser.add_argument(
+        "--rup_group_admission", choices=["off", "shadow", "apply", "conservative"],
+        default="conservative",
+        help="RUP风险约束分组准入：off关闭；shadow只观察；apply激进拒绝；conservative仅在明显迟到且不拆小组时拒绝",
+    )
+    parser.add_argument("--rup_group_admission_min_group_size", type=int, default=3)
+    parser.add_argument("--rup_group_admission_late_slack_ratio", type=float, default=0.05)
+    parser.add_argument("--rup_prox", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_prox_mu", type=float, default=1e-4)
+    parser.add_argument("--rup_state_warmup_reports", type=int, default=3)
+    parser.add_argument("--rup_residual_min_reports", type=int, default=5)
+    parser.add_argument("--rup_residual_window", type=int, default=20)
+    parser.add_argument("--rup_residual_quantile", type=float, default=0.80)
+    parser.add_argument("--rup_trust_fc_lower", type=float, default=0.80)
+    parser.add_argument("--rup_trust_fc_upper", type=float, default=1.20)
+    parser.add_argument("--rup_trust_prev_lower", type=float, default=0.75)
+    parser.add_argument("--rup_trust_prev_upper", type=float, default=1.25)
+    parser.add_argument("--rup_soft_qmin", type=int, default=50)
+    parser.add_argument("--rup_soft_qmax", type=int, default=180)
+    parser.add_argument("--rup_utility_beta", type=float, default=0.20)
+    parser.add_argument("--rup_utility_min_reports", type=int, default=5)
+    parser.add_argument("--rup_utility_lower", type=float, default=0.90)
+    parser.add_argument("--rup_utility_upper", type=float, default=1.10)
+    parser.add_argument("--rup_utility_eval_batches", type=int, default=1)
+    parser.add_argument("--rup_budget_window", type=int, default=50)
+    parser.add_argument("--rup_budget_lower_ratio", type=float, default=0.97)
+    parser.add_argument("--rup_budget_upper_ratio", type=float, default=1.03)
+    parser.add_argument("--rup_budget_max_adjust_ratio", type=float, default=0.10)
+    parser.add_argument("--rup_accuracy_priority", choices=["on", "off"], default="on")
+    parser.add_argument("--rup_accuracy_q_floor_ratio", type=float, default=1.0)
+    parser.add_argument("--rup_accuracy_q_boost_ratio", type=float, default=0.05)
+    parser.add_argument("--rup_accuracy_q_boost_min_confidence", type=float, default=0.5)
+    parser.add_argument(
+        "--rup_accuracy_q_boost_start_accuracy", type=float, default=50.0,
+        help="Only enable accuracy boost after the latest global eval reaches this accuracy; floor remains active.",
+    )
+    parser.add_argument("--rup_risk_gated_floor", choices=["on", "off"], default="off")
+    parser.add_argument("--rup_risk_gated_floor_min_safe_candidates", type=int, default=10)
+    parser.add_argument("--rup_risk_gated_floor_slack_ratio", type=float, default=0.05)
+    parser.add_argument("--rup_q_smoothness", choices=["on", "off"], default="off")
+    parser.add_argument("--rup_q_smooth_max_increase_ratio", type=float, default=0.10)
+    parser.add_argument("--rup_q_smooth_max_decrease_ratio", type=float, default=0.20)
 
     # ──── 虚拟端侧参数 ────
     parser.add_argument("--base_step_time", type=float, default=0.05,

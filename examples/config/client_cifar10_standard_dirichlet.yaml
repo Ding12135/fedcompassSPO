@@ -1,0 +1,24 @@
+train_configs:
+  device: "cuda"
+  logging_id: "Client"
+  logging_output_dirname: "./output"
+  logging_output_filename: "bench_cifar10_standard_dirichlet"
+
+data_configs:
+  dataset_path: "./dataset/federated_dataset.py"
+  dataset_name: "get_federated_dataset"
+  dataset_kwargs:
+    dataset: "cifar10"
+    num_clients: 8
+    client_id: 0
+    partition_strategy: "dirichlet_noniid"
+    seed: 42
+    alpha2: 0.5
+    dirichlet_mode: "standard"
+    visualization: False
+
+comm_configs:
+  grpc_configs:
+    server_uri: localhost:50051
+    max_message_size: 1048576
+    use_ssl: False

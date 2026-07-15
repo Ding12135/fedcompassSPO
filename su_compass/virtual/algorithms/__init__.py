@@ -10,5 +10,7 @@ from .base import VirtualAlgorithmController  # noqa: F401
 from .fedavg import VirtualFedAvgController  # noqa: F401
 from .fedasync import VirtualFedAsyncController  # noqa: F401
 from .fedcompass import VirtualFedCompassController  # noqa: F401
+from .state_compass import VirtualStateCompassController  # noqa: F401
 from .oort_compass import VirtualOortCompassController  # noqa: F401
 from .utility import OortConfig  # noqa: F401
+from .rup_compass import VirtualRUPCompassController  # noqa: F401

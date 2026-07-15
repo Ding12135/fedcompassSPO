@@ -26,6 +26,8 @@ FedCompass）共用同一套 CSV 结构，便于后续 compare_virtual_algorithm
     3. scheduler_trace.csv 看每次上传发生时调度器如何处理它。
     4. FedCompass/Oort 再看 dispatch_decision_trace.csv / oort_trace.csv 解释 Q/group 决策。
     5. client_states/* 追到单个客户端的训练耗时拆分与状态滑窗。
+    6. fedcompass_prediction_trace.csv / fedcompass_problem_report.json 用于证明
+       历史 speed 预测误差及其与 late、deadline 的关系（纯观测，不改变调度）。
 """
 
 import csv
@@ -133,6 +135,173 @@ OORT_TRACE_FIELDS = [
     "num_reports",               # 端侧窗口样本数（判断是否冷启动）
 ]
 
+RUP_TRACE_FIELDS = [
+    "virtual_time", "client_id", "profile_type", "decision", "assigned_group",
+    "mode", "baseline_q", "raw_state_q", "trust_q", "soft_q", "utility_q",
+    "budget_q", "recommended_q", "applied_q", "state_safe_feasible",
+    "num_safe_candidates", "predicted_finish_time", "safe_finish_time",
+    "expected_arrival_time", "latest_arrival_time", "residual_margin",
+    "residual_count", "trust_lower", "trust_upper", "utility_raw",
+    "utility_normalized", "utility_confidence", "utility_reports", "loss_ema",
+    "progress_ema", "budget_ratio_before", "budget_debt_before",
+    "budget_adjustment", "pre_accuracy_q", "accuracy_priority_q",
+    "accuracy_floor_applied", "accuracy_boost_applied",
+    "current_global_accuracy", "accuracy_boost_stage_active",
+    "risk_gated_floor_allowed", "pre_smooth_q", "smooth_q", "q_smooth_applied",
+    "previous_q", "hit_hard_qmin", "hit_hard_qmax", "hit_soft_qmin", "hit_soft_qmax",
+    "fallback_reason", "enabled_layers",
+]
+
+RUP_TRAINING_TRACE_FIELDS = [
+    "client_round_idx", "client_id", "local_steps", "num_train_samples",
+    "loss_before", "loss_after", "loss_delta", "loss_delta_per_step",
+    "prox_mu", "mean_prox_penalty", "mean_base_loss", "num_observed_batches",
+    "finite",
+]
+
+STATE_Q_TRACE_FIELDS = [
+    "virtual_time",
+    "client_id",
+    "assigned_group",
+    "fedcompass_q",
+    "raw_state_q",
+    "state_q",
+    "q_difference",
+    "max_increase_q",
+    "q_increase_clipped",
+    "availability_increase_guard",
+    "unavailable_event_count",
+    "state_safe_feasible",
+    "group_mismatch",
+    "predicted_finish_time",
+    "safe_finish_time",
+    "expected_arrival_time",
+    "latest_arrival_time",
+    "recommendation_reason",
+    "applied_reason",
+    "q_applied_to_dispatch",
+    "actual_dispatched_q",
+    "actual_group_id",
+    "num_state_reports",
+]
+
+# RCP-GS逐候选事实表：一行代表“某客户端在一次dispatch时尝试某个已有group”。
+# 保留各层约束结果，便于定位候选被原规则、deadline、arrival window或训练量
+# 保护规则中的哪一层拒绝。
+GROUP_CANDIDATE_SHADOW_TRACE_FIELDS = [
+    "virtual_time", "client_id", "baseline_group_id", "baseline_q",
+    "baseline_safe_feasible", "candidate_group_id", "fedcompass_reference_q",
+    "candidate_q", "expected_arrival_time", "latest_arrival_time",
+    "predicted_finish_time", "safe_finish_time", "arrival_deviation",
+    "safe_slack", "original_group_feasible", "safe_feasible",
+    "arrival_window_feasible", "work_preserved", "pareto_dominates_baseline",
+    "selected_by_shadow", "rejection_reason",
+]
+
+# RCP-GS逐dispatch推荐表：汇总最终是保持、换到已有组，还是建议沿用
+# FedCompass原create-group路径。Shadow阶段只观测，不实际执行该建议。
+GROUP_RECOMMENDATION_SHADOW_TRACE_FIELDS = [
+    "virtual_time", "client_id", "baseline_group_id", "baseline_q",
+    "baseline_safe_feasible", "baseline_arrival_deviation",
+    "recommended_group_id", "recommended_q", "action", "group_changed",
+    "mismatch_repaired", "num_candidates", "num_pareto_candidates", "reason",
+]
+
+# 风险约束入组事实表：同时记录Shadow建议和真实动作，便于验证shadow不变性，
+# 以及apply时确认mismatch确实沿用FedCompass原始create-group路径。
+GROUP_ADMISSION_TRACE_FIELDS = [
+    "virtual_time", "client_id", "mode", "candidate_group_id",
+    "fedcompass_q", "candidate_trust_q", "trust_q_safe_feasible", "group_mismatch",
+    "current_group_size", "conservative_min_group_size", "predicted_finish_time",
+    "safe_finish_time", "lateness_margin", "late_slack", "severe_late_risk",
+    "preserves_group_size",
+    "shadow_action", "applied_action", "admitted",
+    "fedcompass_create_group_id", "actual_group_id", "actual_dispatched_q", "reason",
+]
+
+ALL_GROUP_FEASIBILITY_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "group_id",
+    "is_current_group", "expected_arrival_time", "latest_arrival_time",
+    "fedcompass_reference_q", "fedcompass_q_feasible", "state_recommended_q",
+    "state_safe_feasible", "predicted_finish_time", "safe_finish_time",
+    "safe_slack", "arrival_deviation", "feasibility_class",
+    "selected_by_shadow", "rejection_reason",
+]
+
+ALL_GROUP_RECOMMENDATION_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "current_group_safe",
+    "num_unexpired_groups", "num_fedcompass_feasible_groups",
+    "num_state_safe_groups", "num_state_only_groups", "recommended_group_id",
+    "recommended_q", "group_changed", "mismatch_repaired", "shadow_action", "reason",
+]
+
+GROUP_CREATION_COUNTERFACTUAL_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "current_q",
+    "current_expected_arrival_time", "current_latest_arrival_time",
+    "current_predicted_finish_time", "current_safe_finish_time",
+    "current_safe_slack", "counterfactual_q",
+    "counterfactual_expected_arrival_time", "counterfactual_latest_arrival_time",
+    "counterfactual_predicted_finish_time", "counterfactual_safe_finish_time",
+    "counterfactual_safe_slack", "counterfactual_safe_feasible",
+    "safe_slack_improvement", "expected_delay_increase", "q_difference",
+    "shadow_action", "reason",
+]
+
+STATE_GROUP_CREATION_Q_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "current_safe_slack",
+    "original_new_group_q", "original_new_group_safe_slack",
+    "original_new_group_safe_feasible", "num_safe_q_candidates",
+    "min_safe_q", "max_safe_q", "recommended_q",
+    "recommended_expected_arrival_time", "recommended_latest_arrival_time",
+    "recommended_predicted_finish_time", "recommended_safe_finish_time",
+    "recommended_safe_slack", "q_difference", "work_retention_ratio",
+    "expected_delay_difference", "shadow_action", "reason",
+]
+
+STATE_GROUP_WINDOW_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "current_safe_slack",
+    "fixed_q", "speed_expected_arrival_time", "speed_latest_arrival_time",
+    "speed_safe_slack", "state_expected_arrival_time",
+    "state_latest_arrival_time", "state_predicted_finish_time",
+    "state_safe_finish_time", "state_safe_slack", "expected_shift",
+    "predicted_duration", "uncertainty", "predicted_compute_duration",
+    "predicted_communication_duration", "predicted_spike_duration",
+    "predicted_availability_duration", "predicted_availability_risk_duration",
+    "availability_event_rate", "availability_event_count",
+    "predictor_used_fallback", "predictor_num_reports",
+    "latest_shift", "safe_slack_improvement", "state_window_safe_feasible",
+    "shadow_action", "reason",
+]
+
+STATE_WINDOW_ADMISSION_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "current_group_safe",
+    "current_safe_slack", "other_existing_group_safe", "num_other_safe_groups",
+    "state_new_group_safe", "state_new_group_q",
+    "state_new_group_expected_arrival_time", "state_new_group_latest_arrival_time",
+    "state_new_group_safe_slack", "shadow_action", "applied_action", "reason",
+]
+
+COMMUNICATION_TAIL_RISK_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "state_new_group_q",
+    "num_reports", "communication_mean", "communication_std",
+    "communication_p90", "communication_recent_max", "existing_uncertainty",
+    "p90_tail_excess", "max_tail_excess", "incremental_p90_margin",
+    "incremental_max_margin", "original_safe_slack",
+    "p90_calibrated_safe_slack", "max_calibrated_safe_slack",
+    "p90_safe_feasible", "max_safe_feasible", "shadow_action", "reason",
+]
+
+COMMUNICATION_ROBUST_Q_TRACE_FIELDS = [
+    "virtual_time", "client_id", "current_group_id", "group_latest_time",
+    "original_q", "recommended_q", "q_reduction", "work_retention_ratio",
+    "communication_std", "risk_beta", "target_communication_risk",
+    "existing_uncertainty", "incremental_communication_reserve",
+    "original_robust_slack", "recommended_predicted_finish_time",
+    "recommended_safe_finish_time", "recommended_robust_finish_time",
+    "recommended_robust_slack", "robust_safe_feasible", "num_q_candidates",
+    "shadow_action", "reason",
+]
+
 TRAINING_METRICS_FIELDS = [
     "global_timestamp",          # 当前全局模型版本号
     "virtual_time",              # 本次聚合发生时间
@@ -185,6 +354,68 @@ ROUND_REPORT_FIELDS = [
     "speed_smoothed_at_upload",  # 上传处理后调度器看到的平滑 speed
 ]
 
+FEDCOMPASS_PREDICTION_TRACE_FIELDS = [
+    "client_round_idx",
+    "client_id",
+    "profile_type",
+    "dispatch_time",
+    "finish_time",
+    "decision",
+    "group_id",
+    "local_steps",
+    "speed_smoothed_at_dispatch",  # FedCompass 做决定时真实使用的历史平滑 speed
+    "predicted_duration",          # Q * speed_smoothed_at_dispatch
+    "actual_duration",
+    "signed_prediction_error",     # actual - predicted；正数表示低估耗时
+    "absolute_prediction_error",
+    "relative_prediction_error",
+    "predicted_finish_time",
+    "target_arrival_time",
+    "latest_arrival_time",
+    "target_arrival_error",        # actual_finish - target；正数表示晚于期望时间
+    "deadline_margin",             # latest - actual_finish；负数表示迟到
+    "late",
+    "train_time",
+    "communication_time",
+    "spike_delay",
+    "availability_wait",
+    "non_compute_time",
+    "communication_ratio",
+    "state_predicted_duration",
+    "state_predicted_finish_time",
+    "state_signed_prediction_error",
+    "state_absolute_prediction_error",
+    "state_relative_prediction_error",
+    "state_error_reduction",
+    "state_error_reduction_ratio",
+    "state_uncertainty",
+    "state_safe_duration",
+    "state_compute_duration",
+    "state_communication_duration",
+    "state_spike_duration",
+    "state_availability_duration",
+    "state_availability_risk_duration",
+    "state_availability_event_rate",
+    "state_availability_event_count",
+    "state_availability_strategy_active",
+    "state_used_fallback",
+    "state_num_reports_at_dispatch",
+    "fedcompass_actual_q",
+    "shadow_recommended_q",
+    "shadow_q_difference",
+    "shadow_predicted_duration",
+    "shadow_predicted_finish_time",
+    "shadow_safe_duration",
+    "shadow_safe_finish_time",
+    "shadow_expected_deviation",
+    "actual_q_state_expected_deviation",
+    "shadow_safe_feasible",
+    "shadow_hit_qmin",
+    "shadow_hit_qmax",
+    "shadow_num_safe_candidates",
+    "shadow_recommendation_reason",
+]
+
 
 # ──────────────────────── TraceWriter ────────────────────────
 
@@ -218,10 +449,28 @@ class TraceWriter:
         self.aggregation_rows: List[Dict[str, Any]] = []
         self.dispatch_decision_rows: List[Dict[str, Any]] = []
         self.oort_rows: List[Dict[str, Any]] = []
+        self.rup_rows: List[Dict[str, Any]] = []
+        self.rup_training_rows: List[Dict[str, Any]] = []
+        self.state_q_rows: List[Dict[str, Any]] = []
+        self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
+        self.group_recommendation_shadow_rows: List[Dict[str, Any]] = []
+        self.group_admission_rows: List[Dict[str, Any]] = []
+        self.all_group_feasibility_rows: List[Dict[str, Any]] = []
+        self.all_group_recommendation_rows: List[Dict[str, Any]] = []
+        self.group_creation_counterfactual_rows: List[Dict[str, Any]] = []
+        self.state_group_creation_q_rows: List[Dict[str, Any]] = []
+        self.state_group_window_rows: List[Dict[str, Any]] = []
+        self.state_window_admission_rows: List[Dict[str, Any]] = []
+        self.communication_tail_risk_rows: List[Dict[str, Any]] = []
+        self.communication_robust_q_rows: List[Dict[str, Any]] = []
         self.training_rows: List[Dict[str, Any]] = []
         self.global_eval_rows: List[Dict[str, Any]] = []
         self.round_report_rows: Dict[str, List[Dict[str, Any]]] = {}
         self.state_trace_rows: Dict[str, List[Dict[str, Any]]] = {}
+        self.fedcompass_prediction_rows: List[Dict[str, Any]] = []
+        self.fedcompass_problem_report: Optional[Dict[str, Any]] = None
+        self.latency_shadow_report: Optional[Dict[str, Any]] = None
+        self.q_shadow_report: Optional[Dict[str, Any]] = None
         self._aggregation_id = 0  # aggregation_trace 自增主键
 
     def record_scheduler_event(
@@ -300,9 +549,78 @@ class TraceWriter:
         """
         self.oort_rows.append(row)
 
+    def record_rup_decision(self, row: Dict[str, Any]) -> None:
+        """Record one fully decomposed RUP workload decision."""
+        self.rup_rows.append(row)
+
+    def record_rup_training(self, row: Dict[str, Any]) -> None:
+        """Record local loss/prox facts independently from scheduling traces."""
+        self.rup_training_rows.append(row)
+
+    def record_state_q_decision(self, row: Dict[str, Any]) -> None:
+        """记录StateCompass真正应用Q时的基线/新Q对照与group mismatch。"""
+        self.state_q_rows.append(row)
+
+    def record_group_candidate_shadow(self, row: Dict[str, Any]) -> None:
+        """记录RCP-GS对单个已有group的可行性与Pareto筛选结果。"""
+        self.group_candidate_shadow_rows.append(row)
+
+    def record_group_recommendation_shadow(self, row: Dict[str, Any]) -> None:
+        """记录RCP-GS一次dispatch的最终旁路推荐；该记录不会改变调度。"""
+        self.group_recommendation_shadow_rows.append(row)
+
+    def record_group_admission(self, row: Dict[str, Any]) -> None:
+        """记录一次已有group的风险约束准入判定。"""
+        self.group_admission_rows.append(row)
+
+    def record_all_group_feasibility(self, row: Dict[str, Any]) -> None:
+        """记录一个未过期已有组的全量可行性Shadow事实。"""
+        self.all_group_feasibility_rows.append(row)
+
+    def record_all_group_recommendation(self, row: Dict[str, Any]) -> None:
+        """记录一次全量已有组Shadow汇总推荐。"""
+        self.all_group_recommendation_rows.append(row)
+
+    def record_group_creation_counterfactual(self, row: Dict[str, Any]) -> None:
+        """记录一次mismatch的新建组反事实，不表示真实执行了建组。"""
+        self.group_creation_counterfactual_rows.append(row)
+
+    def record_state_group_creation_q(self, row: Dict[str, Any]) -> None:
+        """记录一次mismatch的新组Q全区间Shadow枚举汇总。"""
+        self.state_group_creation_q_rows.append(row)
+
+    def record_state_group_window(self, row: Dict[str, Any]) -> None:
+        """记录固定Q的speed/状态新组时间窗Shadow对照。"""
+        self.state_group_window_rows.append(row)
+
+    def record_state_window_admission(self, row: Dict[str, Any]) -> None:
+        """记录一次状态时间窗组合准入Shadow建议。"""
+        self.state_window_admission_rows.append(row)
+
+    def record_communication_tail_risk(self, row: Dict[str, Any]) -> None:
+        """记录状态新组通信尾部风险建议；该事实表不参与真实调度。"""
+        self.communication_tail_risk_rows.append(row)
+
+    def record_communication_robust_q(self, row: Dict[str, Any]) -> None:
+        """记录固定状态组时间窗内的通信稳健Q建议。"""
+        self.communication_robust_q_rows.append(row)
+
     def record_group(self, row: Dict[str, Any]) -> None:
         """记录一条 group_trace 行。"""
         self.group_rows.append(row)
+
+    def set_fedcompass_problem_diagnostics(
+        self,
+        prediction_rows: List[Dict[str, Any]],
+        report: Dict[str, Any],
+        shadow_report: Optional[Dict[str, Any]] = None,
+        q_shadow_report: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """接收独立观测器的诊断结果，统一由 TraceWriter 在实验末尾落盘。"""
+        self.fedcompass_prediction_rows = list(prediction_rows)
+        self.fedcompass_problem_report = dict(report)
+        self.latency_shadow_report = dict(shadow_report) if shadow_report is not None else None
+        self.q_shadow_report = dict(q_shadow_report) if q_shadow_report is not None else None
 
     def record_training_metrics(
         self,
@@ -448,9 +766,122 @@ class TraceWriter:
             DISPATCH_DECISION_TRACE_FIELDS,
         )
         _write_csv(self.output_dir / "group_trace.csv", self.group_rows, GROUP_TRACE_FIELDS)
+        if self.fedcompass_prediction_rows:
+            _write_csv(
+                self.output_dir / "fedcompass_prediction_trace.csv",
+                self.fedcompass_prediction_rows,
+                FEDCOMPASS_PREDICTION_TRACE_FIELDS,
+            )
+            # shadow表与问题诊断表暂时共享逐轮事实字段，单独命名是为了后续加入
+            # 更多预测器时不影响已固定的FedCompass问题证据读取脚本。
+            _write_csv(
+                self.output_dir / "latency_prediction_shadow_trace.csv",
+                self.fedcompass_prediction_rows,
+                FEDCOMPASS_PREDICTION_TRACE_FIELDS,
+            )
+            _write_csv(
+                self.output_dir / "q_recommendation_shadow_trace.csv",
+                self.fedcompass_prediction_rows,
+                FEDCOMPASS_PREDICTION_TRACE_FIELDS,
+            )
+        if self.fedcompass_problem_report is not None:
+            _write_json(
+                self.output_dir / "fedcompass_problem_report.json",
+                self.fedcompass_problem_report,
+            )
+        if self.latency_shadow_report is not None:
+            _write_json(
+                self.output_dir / "latency_prediction_shadow_report.json",
+                self.latency_shadow_report,
+            )
+        if self.q_shadow_report is not None:
+            _write_json(
+                self.output_dir / "q_recommendation_shadow_report.json",
+                self.q_shadow_report,
+            )
         # oort_trace 只在 Oort-Compass 变体产生；baseline 不写空表，避免误判为启用 Oort。
         if self.oort_rows:
             _write_csv(self.output_dir / "oort_trace.csv", self.oort_rows, OORT_TRACE_FIELDS)
+        if self.rup_rows:
+            _write_csv(self.output_dir / "rup_decision_trace.csv", self.rup_rows, RUP_TRACE_FIELDS)
+        if self.rup_training_rows:
+            _write_csv(
+                self.output_dir / "rup_training_trace.csv",
+                self.rup_training_rows,
+                RUP_TRAINING_TRACE_FIELDS,
+            )
+        if self.state_q_rows:
+            _write_csv(
+                self.output_dir / "state_q_trace.csv",
+                self.state_q_rows,
+                STATE_Q_TRACE_FIELDS,
+            )
+        if self.group_candidate_shadow_rows:
+            _write_csv(
+                self.output_dir / "group_candidate_shadow_trace.csv",
+                self.group_candidate_shadow_rows,
+                GROUP_CANDIDATE_SHADOW_TRACE_FIELDS,
+            )
+        if self.group_recommendation_shadow_rows:
+            _write_csv(
+                self.output_dir / "group_recommendation_shadow_trace.csv",
+                self.group_recommendation_shadow_rows,
+                GROUP_RECOMMENDATION_SHADOW_TRACE_FIELDS,
+            )
+        if self.group_admission_rows:
+            _write_csv(
+                self.output_dir / "group_admission_trace.csv",
+                self.group_admission_rows,
+                GROUP_ADMISSION_TRACE_FIELDS,
+            )
+        if self.all_group_feasibility_rows:
+            _write_csv(
+                self.output_dir / "all_group_feasibility_shadow_trace.csv",
+                self.all_group_feasibility_rows,
+                ALL_GROUP_FEASIBILITY_TRACE_FIELDS,
+            )
+        if self.all_group_recommendation_rows:
+            _write_csv(
+                self.output_dir / "all_group_recommendation_shadow_trace.csv",
+                self.all_group_recommendation_rows,
+                ALL_GROUP_RECOMMENDATION_TRACE_FIELDS,
+            )
+        if self.group_creation_counterfactual_rows:
+            _write_csv(
+                self.output_dir / "group_creation_counterfactual_shadow_trace.csv",
+                self.group_creation_counterfactual_rows,
+                GROUP_CREATION_COUNTERFACTUAL_TRACE_FIELDS,
+            )
+        if self.state_group_creation_q_rows:
+            _write_csv(
+                self.output_dir / "state_group_creation_q_shadow_trace.csv",
+                self.state_group_creation_q_rows,
+                STATE_GROUP_CREATION_Q_TRACE_FIELDS,
+            )
+        if self.state_group_window_rows:
+            _write_csv(
+                self.output_dir / "state_group_window_shadow_trace.csv",
+                self.state_group_window_rows,
+                STATE_GROUP_WINDOW_TRACE_FIELDS,
+            )
+        if self.state_window_admission_rows:
+            _write_csv(
+                self.output_dir / "state_window_admission_shadow_trace.csv",
+                self.state_window_admission_rows,
+                STATE_WINDOW_ADMISSION_TRACE_FIELDS,
+            )
+        if self.communication_tail_risk_rows:
+            _write_csv(
+                self.output_dir / "communication_tail_risk_shadow_trace.csv",
+                self.communication_tail_risk_rows,
+                COMMUNICATION_TAIL_RISK_TRACE_FIELDS,
+            )
+        if self.communication_robust_q_rows:
+            _write_csv(
+                self.output_dir / "communication_robust_q_shadow_trace.csv",
+                self.communication_robust_q_rows,
+                COMMUNICATION_ROBUST_Q_TRACE_FIELDS,
+            )
         _write_csv(self.output_dir / "training_metrics.csv", self.training_rows, TRAINING_METRICS_FIELDS)
         _write_csv(self.output_dir / "global_eval_trace.csv", self.global_eval_rows, GLOBAL_EVAL_TRACE_FIELDS)
 
