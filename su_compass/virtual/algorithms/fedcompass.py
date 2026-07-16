@@ -99,6 +99,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             "local_models": {},
             "local_steps": {},
             "timestamp": {},
+            "decision_id": {},
         }
         self.global_timestamp: int = 0                     # 全局模型版本号，只按真实聚合次数递增
         self._num_global_epochs: int = 0                   # 客户端更新贡献预算，单更 +1，组更 +len(local_models)
@@ -117,17 +118,20 @@ class VirtualFedCompassController(VirtualAlgorithmController):
         self._pending_dispatch_after_upload: Dict[str, Dict[str, Any]] = {}  # 组聚合会一次重派多人，先暂存每人的 next_group
         self._current_runtime_state: Any = None              # 当前 upload 的 RuntimeStateTracker 快照，只用于 trace 决策上下文
         self._client_ids: List[str] = []
+        self._client_dispatch_index: Dict[str, int] = {}
 
     # ═══════════════════════ 接口实现 ═══════════════════════
 
     def initialize(self, client_ids: List[str], initial_global_model: Dict) -> None:
         """初始化并为所有客户端创建首轮 dispatch。"""
         self._client_ids = list(client_ids)
+        self._client_dispatch_index = {cid: 0 for cid in client_ids}
         self._current_global_model = copy.deepcopy(initial_global_model)
         self._virtual_now = 0.0
 
         # 首轮尚无速度反馈，先给所有客户端最大 Q；首轮回传后才有 speed_momentum 可用。
         for cid in self._client_ids:
+            decision_id = self._next_decision_id(cid)
             self._dispatch_queue.append(Dispatch(
                 client_id=cid,
                 global_model=copy.deepcopy(self._current_global_model),
@@ -135,6 +139,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
                 local_steps=self.max_local_steps,
                 staleness=0,
                 model_version_at_dispatch=self.global_timestamp,
+                decision_id=decision_id,
             ))
 
     def on_client_upload(self, event: VirtualEvent, virtual_now: float) -> List[VirtualEvent]:
@@ -156,12 +161,14 @@ class VirtualFedCompassController(VirtualAlgorithmController):
         # _record_info / 聚合逻辑会修改 client_info，因此 trace 需要的“上传前状态”
         # 必须在任何状态变更前取出来。
         upload_group_id = self.client_info.get(client_id, {}).get("goa", -1)
+        upload_decision_id = str(event.payload.get("decision_id", ""))
         model_version_at_upload = self.client_info.get(client_id, {}).get("timestamp", 0)
         dispatch_staleness = report.staleness  # 来自 Dispatch，即派发时陈旧度
         self._current_runtime_state = event.payload.get("runtime_state")  # 供决策 trace 使用
 
         # ──── 步骤 1：更新速度估计（对齐 _record_info）────
         self._record_info(client_id, report)
+        self.client_info[client_id]["active_decision_id"] = upload_decision_id
         speed_raw = report.round_time / max(report.local_steps, 1)
         speed_smoothed = self.client_info[client_id]["speed"]  # 平滑后，调度器实际使用的 speed
         aggregation_staleness: Optional[int] = None
@@ -219,6 +226,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             "speed_raw": speed_raw,
             "speed_smoothed": speed_smoothed,
             "dispatch_staleness": dispatch_staleness,
+            "decision_id": upload_decision_id,
         }  # Runner 通过 pop_upload_result() 取出并写入 scheduler_trace / round_reports
 
         return new_events
@@ -348,6 +356,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
                 participating={client_id: agg_staleness},
                 local_steps={client_id: self.client_info[client_id]["local_steps"]},
                 model_versions={client_id: self.client_info[client_id]["timestamp"]},
+                decision_ids={client_id: self.client_info[client_id].get("active_decision_id", "")},
                 group_id=-1,
                 budget_delta=1,
                 ts_before=ts_before,
@@ -358,6 +367,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             self.general_buffer["local_models"][client_id] = local_model
             self.general_buffer["local_steps"][client_id] = self.client_info[client_id]["local_steps"]
             self.general_buffer["timestamp"][client_id] = self.client_info[client_id]["timestamp"]
+            self.general_buffer["decision_id"][client_id] = self.client_info[client_id].get("active_decision_id", "")
 
         self.client_info[client_id]["timestamp"] = self.global_timestamp
         self._num_global_epochs += 1
@@ -408,10 +418,12 @@ class VirtualFedCompassController(VirtualAlgorithmController):
                     "local_models": {},
                     "local_steps": {},
                     "timestamp": {},
+                    "decision_id": {},
                 }
             self.group_buffer[group_idx]["local_models"][client_id] = local_model
             self.group_buffer[group_idx]["local_steps"][client_id] = self.client_info[client_id]["local_steps"]
             self.group_buffer[group_idx]["timestamp"][client_id] = self.client_info[client_id]["timestamp"]
+            self.group_buffer[group_idx]["decision_id"][client_id] = self.client_info[client_id].get("active_decision_id", "")
 
             self._pending_results[client_id] = {"group_idx": group_idx}
 
@@ -449,6 +461,10 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             **self.general_buffer["timestamp"],
             **self.group_buffer[group_idx]["timestamp"],
         }
+        decision_ids = {
+            **self.general_buffer["decision_id"],
+            **self.group_buffer[group_idx]["decision_id"],
+        }
         staleness = {
             cid: self.global_timestamp - timestamp[cid]
             for cid in timestamp
@@ -459,6 +475,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             "local_models": {},
             "local_steps": {},
             "timestamp": {},
+            "decision_id": {},
         }
 
         global_model = self.aggregator.aggregate(
@@ -481,6 +498,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             participating=staleness,
             local_steps=local_steps_map,
             model_versions=timestamp,
+            decision_ids=decision_ids,
             group_id=group_idx,
             budget_delta=len(local_models),
             ts_before=ts_before,
@@ -500,6 +518,9 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             "trigger": trigger,
             "merged_general_buffer": int(merged_general),
             "per_client_staleness": json.dumps(staleness),
+            "time_source": self.arrival_group[group_idx].get("time_source", "fedcompass_speed"),
+            "anchor_client_id": self.arrival_group[group_idx].get("anchor_client_id", ""),
+            "anchor_q": self.arrival_group[group_idx].get("anchor_q", ""),
         })
         self._group_late_clients.pop(group_idx, None)
 
@@ -551,6 +572,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             - 无活跃 group → 创建新 group
             - 有活跃 group → 尝试 _join_group，失败则 _create_group
         """
+        self._prepare_next_decision(client_id)
         curr_time = self._virtual_now
         new_events: List[VirtualEvent] = []
 
@@ -566,6 +588,9 @@ class VirtualFedCompassController(VirtualAlgorithmController):
                 "expected_arrival_time": expected,   # 目标到齐时间，join_group 用它反推 Q
                 "latest_arrival_time": latest,       # 迟到判据，deadline 事件也排在这个时间
                 "created_time": curr_time,           # group 创建时间，用于 trace 和 Oort slack/span
+                "time_source": "fedcompass_speed",
+                "anchor_client_id": client_id,
+                "anchor_q": self.max_local_steps,
             }
 
             if self.group_counter not in self._deadline_events:
@@ -698,6 +723,9 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             "expected_arrival_time": expected,   # 当前客户端按 assigned_steps 预计完成的时间
             "latest_arrival_time": latest,       # expected 按 latest_time_factor 放宽后的迟到线
             "created_time": curr_time,           # 用于后续 group_trace / Oort 风险余量计算
+            "time_source": "fedcompass_speed",
+            "anchor_client_id": client_id,
+            "anchor_q": assigned_steps,
         }
 
         # 用事件队列替代 threading.Timer
@@ -751,7 +779,24 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             latest_arrival_time=latest_arrival,
             staleness=dispatch_staleness,
             model_version_at_dispatch=self.global_timestamp,
+            decision_id=self.client_info[client_id].get("decision_id", ""),
         ))
+        self.client_info[client_id]["active_decision_id"] = self.client_info[client_id].get("decision_id", "")
+        self.client_info[client_id]["_decision_prepared"] = False
+
+    def _next_decision_id(self, client_id: str) -> str:
+        index = self._client_dispatch_index.get(client_id, 0)
+        self._client_dispatch_index[client_id] = index + 1
+        return f"{client_id}_dispatch_{index}"
+
+    def _prepare_next_decision(self, client_id: str) -> str:
+        info = self.client_info[client_id]
+        if info.get("_decision_prepared", False):
+            return str(info["decision_id"])
+        decision_id = self._next_decision_id(client_id)
+        info["decision_id"] = decision_id
+        info["_decision_prepared"] = True
+        return decision_id
 
     def _record_aggregation_trace(
         self,
@@ -759,6 +804,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
         participating: Dict[str, int],
         local_steps: Dict[str, int],
         model_versions: Dict[str, int],
+        decision_ids: Dict[str, str],
         group_id: int,
         budget_delta: int,
         ts_before: int,
@@ -777,6 +823,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             "per_client_staleness": json.dumps(participating),
             "per_client_local_steps": json.dumps(local_steps),
             "per_client_model_version": json.dumps(model_versions),
+            "per_client_decision_id": json.dumps(decision_ids),
             "group_id": group_id,
             "num_clients": len(participating),
             "client_update_budget_delta": budget_delta,
@@ -804,6 +851,7 @@ class VirtualFedCompassController(VirtualAlgorithmController):
         availability_rate = state.availability_rate if state is not None else ""
 
         self._dispatch_decision_trace_buffer.append({
+            "decision_id": self.client_info[client_id].get("decision_id", ""),
             "virtual_time": self._virtual_now,
             "client_id": client_id,
             "decision": decision,

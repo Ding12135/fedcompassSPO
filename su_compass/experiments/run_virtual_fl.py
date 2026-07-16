@@ -21,11 +21,15 @@ su_compass.experiments.run_virtual_fl — 虚拟时间联邦学习统一实验�
 
 import argparse
 import copy
+import json
 import sys
 import os
 import random
+import subprocess
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Dict, List, Any, Optional
 
 import numpy as np
@@ -64,6 +68,10 @@ from su_compass.virtual.algorithms.fedcompass import VirtualFedCompassController
 from su_compass.virtual.algorithms.oort_compass import VirtualOortCompassController
 from su_compass.virtual.algorithms.state_compass import VirtualStateCompassController
 from su_compass.virtual.algorithms.rup_compass import VirtualRUPCompassController
+from su_compass.virtual.algorithms.state_driven_compass import (
+    VirtualStateDrivenCompassController,
+)
+from su_compass.scheduling.state_driven_config import StateDrivenConfig
 from su_compass.virtual.algorithms.utility import OortConfig
 from su_compass.virtual.training import RUPTrainingAdapter
 from su_compass.scheduling.policies import RUPConfig
@@ -86,6 +94,7 @@ def run_experiment(args: argparse.Namespace) -> None:
         6. 写出 trace。
     """
     t0 = time.time()
+    started_at = datetime.now(timezone.utc).isoformat()
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -325,6 +334,19 @@ def run_experiment(args: argparse.Namespace) -> None:
                 row["profile_type"] = client_runtime.get_profile_type(row["client_id"])
                 trace.record_rup_outcome(row)
 
+        if hasattr(controller, "pop_state_time_traces"):
+            for row in controller.pop_state_time_traces():
+                trace.record_state_time(row)
+        if hasattr(controller, "pop_joint_group_q_traces"):
+            for row in controller.pop_joint_group_q_traces():
+                trace.record_joint_group_q(row)
+        if hasattr(controller, "pop_joint_group_q_candidate_traces"):
+            for row in controller.pop_joint_group_q_candidate_traces():
+                trace.record_joint_group_q_candidate(row)
+        if hasattr(controller, "pop_state_group_creation_traces"):
+            for row in controller.pop_state_group_creation_traces():
+                trace.record_state_group_creation(row)
+
         if hasattr(controller, "pop_state_q_traces"):
             for state_q in controller.pop_state_q_traces():
                 trace.record_state_q_decision(state_q)
@@ -397,6 +419,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                 staleness=dispatch.staleness,
             )
             event.payload["client_round_idx"] = client_round_idx  # 供 upload 处理后 enrich round_reports
+            event.payload["decision_id"] = dispatch.decision_id
 
             observation = event.payload.get("rup_training_observation")
             if observation is not None:
@@ -412,6 +435,7 @@ def run_experiment(args: argparse.Namespace) -> None:
             trace.record_round_report(
                 cid, result.report, result, profile_type, client_round_idx,
                 model_version_at_dispatch=dispatch.model_version_at_dispatch,
+                decision_id=dispatch.decision_id,
             )
             trace.record_state_trace(cid, state, profile_type, client_round_idx)
             client_round_counters[cid] += 1
@@ -462,6 +486,7 @@ def run_experiment(args: argparse.Namespace) -> None:
             upload_group_id = upload_meta.get("upload_group_id", -1) if upload_meta else -1
             next_group_id = upload_meta.get("next_group_id", -1) if upload_meta else -1
             model_version_at_upload = upload_meta.get("model_version_at_upload", 0) if upload_meta else 0
+            decision_id = upload_meta.get("decision_id", event.payload.get("decision_id", "")) if upload_meta else event.payload.get("decision_id", "")
 
             trace.record_scheduler_event(
                 virtual_time=virtual_now,
@@ -479,6 +504,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                 next_group_id=next_group_id,
                 model_version_at_upload=model_version_at_upload,
                 runtime_state=runtime_state,
+                decision_id=decision_id,
             )
 
             if upload_meta is not None:
@@ -491,6 +517,7 @@ def run_experiment(args: argparse.Namespace) -> None:
                     upload_group_id=upload_group_id,
                     next_group_id=next_group_id,
                     speed_smoothed_at_upload=speed_smoothed,
+                    decision_id=decision_id,
                 )
 
         elif event.event_type == EventType.FEDCOMPASS_GROUP_DEADLINE:
@@ -565,6 +592,41 @@ def run_experiment(args: argparse.Namespace) -> None:
             "prox_mu": args.rup_prox_mu,
             "utility_eval_batches": args.rup_utility_eval_batches,
         })
+    if args.algorithm == "state_driven_compass":
+        experiment_config["state_driven_config"] = asdict(_state_driven_config_from_args(args))
+        experiment_config["predictor_name"] = controller.predictor_name
+        experiment_config["predictor_version"] = controller.predictor_version
+    manifest = {
+        "git_commit_sha": _git_value(["rev-parse", "HEAD"]),
+        "git_branch": _git_value(["branch", "--show-current"]),
+        "git_dirty": bool(_git_value(["status", "--porcelain"])),
+        "algorithm": args.algorithm,
+        "preset": variant,
+        "seed": args.seed,
+        "server_config": args.server_config,
+        "client_config": args.client_config,
+        "qmin": qmin,
+        "qmax": qmax,
+        "latest_time_factor": sched_kwargs.get("latest_time_factor", 1.2),
+        "started_at_utc": started_at,
+        "command": " ".join(sys.argv),
+    }
+    if args.algorithm == "state_driven_compass":
+        sd_config = _state_driven_config_from_args(args)
+        manifest.update({
+            "state_driven_config": asdict(sd_config),
+            "predictor_name": controller.predictor_name,
+            "predictor_version": controller.predictor_version,
+            "cold_start_mode": sd_config.cold_start_mode,
+            "initial_dispatch_mode": sd_config.initial_dispatch_mode,
+            "state_control_start_condition": sd_config.state_control_start_condition,
+            "safe_window_overflow_policy": sd_config.safe_window_overflow_policy,
+        })
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    (output_path / "experiment_manifest.json").write_text(
+        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
     if problem_observer is not None:
         trace.set_fedcompass_problem_diagnostics(
             prediction_rows=problem_observer.prediction_rows(),
@@ -577,7 +639,6 @@ def run_experiment(args: argparse.Namespace) -> None:
         completed_work = sum(int(row.get("local_steps", 0)) for row in trace.scheduler_rows)
         aggregated_work = 0
         aggregated_updates = 0
-        import json
         for row in trace.aggregation_rows:
             values = json.loads(row.get("per_client_local_steps", "{}"))
             aggregated_work += sum(int(value) for value in values.values())
@@ -598,6 +659,9 @@ def run_experiment(args: argparse.Namespace) -> None:
         })
         trace.set_rup_terminal_state(terminal)
     trace.flush(experiment_config=experiment_config)
+    if args.algorithm == "state_driven_compass":
+        from su_compass.experiments.analyze_state_driven import write_summary
+        write_summary(output_path)
 
     if progress is not None:
         budget_used = (
@@ -627,6 +691,16 @@ def run_experiment(args: argparse.Namespace) -> None:
         summary.append(f"最终验证精度: {last_accuracy:.2f}%")
     summary.append(f"输出目录: {args.output_dir}")
     print_run_footer(success=True, elapsed_s=elapsed, summary_lines=summary, enabled=show_ui)
+    (output_path / "run_complete.json").write_text(
+        json.dumps({
+            "status": "complete",
+            "finished_at_utc": datetime.now(timezone.utc).isoformat(),
+            "elapsed_seconds": elapsed,
+            "client_update_budget_used": budget_used,
+            "global_timestamp": controller.get_global_timestamp(),
+        }, indent=2, ensure_ascii=False),
+        encoding="utf-8",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -680,6 +754,28 @@ def _rup_config_from_args(args) -> RUPConfig:
         q_smooth_max_decrease_ratio=getattr(args, "rup_q_smooth_max_decrease_ratio", 0.20),
     )
 
+
+def _git_value(arguments: list[str]) -> str:
+    try:
+        return subprocess.run(
+            ["git", *arguments], check=False, capture_output=True,
+            text=True, cwd=Path(__file__).resolve().parents[2],
+        ).stdout.strip()
+    except OSError:
+        return ""
+
+
+def _state_driven_config_from_args(args) -> StateDrivenConfig:
+    return StateDrivenConfig(
+        existing_group_mode=args.sd_existing_group_mode,
+        new_group_window_mode=args.sd_new_group_window_mode,
+        new_group_q_mode=args.sd_new_group_q_mode,
+        candidate_trace_level=args.sd_candidate_trace_level,
+        target_band_ratio=args.sd_target_band_ratio,
+        min_group_slack=args.sd_min_group_slack,
+        max_group_slack=args.sd_max_group_slack,
+    )
+
 def _create_aggregator(algorithm: str, model, server_config) -> Any:
     """根据算法名创建对应的 APPFL 聚合器。
 
@@ -699,7 +795,7 @@ def _create_aggregator(algorithm: str, model, server_config) -> Any:
         return FedAvgAggregator(model=copy.deepcopy(model), aggregator_config=agg_config, logger=logger)
     elif algorithm == "fedasync":
         return FedAsyncAggregator(model=copy.deepcopy(model), aggregator_config=agg_config, logger=logger)
-    elif algorithm in ("fedcompass", "oort_compass", "state_compass", "rup_compass"):
+    elif algorithm in ("fedcompass", "oort_compass", "state_compass", "rup_compass", "state_driven_compass"):
         # oort_compass 复用 FedCompass 聚合器，仅调度层引入 Oort 效用
         return FedCompassAggregator(model=copy.deepcopy(model), aggregator_config=agg_config, logger=logger)
     else:
@@ -763,6 +859,17 @@ def _create_controller(args, aggregator, sched_kwargs):
             num_global_epochs=args.num_global_epochs,
             rup_config=_rup_config_from_args(args),
         )
+    elif args.algorithm == "state_driven_compass":
+        return VirtualStateDrivenCompassController(
+            aggregator=aggregator,
+            num_clients=args.num_clients,
+            min_local_steps=sched_kwargs.get("min_local_steps", args.min_local_steps),
+            max_local_steps=sched_kwargs.get("max_local_steps", args.max_local_steps),
+            speed_momentum=sched_kwargs.get("speed_momentum", 0.9),
+            latest_time_factor=sched_kwargs.get("latest_time_factor", 1.2),
+            num_global_epochs=args.num_global_epochs,
+            state_driven_config=_state_driven_config_from_args(args),
+        )
     elif args.algorithm == "oort_compass":
         # 与 FedCompass 共享全部调度参数，额外注入 Oort 配置（mode + λ 权重）
         oort_config = OortConfig(
@@ -809,7 +916,7 @@ def parse_args() -> argparse.Namespace:
 
     # ──── 核心参数 ────
     parser.add_argument("--algorithm", type=str, default="fedcompass",
-                        choices=["fedavg", "fedasync", "fedcompass", "oort_compass", "state_compass", "rup_compass"],
+                        choices=["fedavg", "fedasync", "fedcompass", "oort_compass", "state_compass", "rup_compass", "state_driven_compass"],
                         help="联邦学习算法")
     parser.add_argument("--server_config", type=str,
                         default="examples/config/server_fedcompass_paper_mnist8.yaml",
@@ -853,6 +960,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--communication_robust_q_mode", type=str, default="off",
                         choices=["off", "shadow"],
                         help="固定状态组时间窗的通信稳健Q：off关闭；shadow只建议")
+
+    # State-Driven FedCompass论文级消融开关。
+    parser.add_argument("--sd_existing_group_mode", choices=["fedcompass", "state_shadow", "state_apply"], default="state_apply")
+    parser.add_argument("--sd_new_group_window_mode", choices=["fedcompass", "state_shadow_fixed_q", "state_apply_fixed_q", "state_apply"], default="state_apply")
+    parser.add_argument("--sd_new_group_q_mode", choices=["fedcompass", "qmax_anchor"], default="qmax_anchor")
+    parser.add_argument("--sd_candidate_trace_level", choices=["none", "summary", "full"], default="summary")
+    parser.add_argument("--sd_target_band_ratio", type=float, default=0.05)
+    parser.add_argument("--sd_min_group_slack", type=float, default=0.5)
+    parser.add_argument("--sd_max_group_slack", type=float, default=120.0)
 
     # ──── RUP-Compass 可插拔层（仅 --algorithm rup_compass 生效）────
     parser.add_argument("--rup_mode", choices=["off", "shadow", "apply"], default="apply")

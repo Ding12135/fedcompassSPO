@@ -40,7 +40,7 @@ from typing import Any, Dict, Iterable, List, Optional
 # 各 CSV 的列名常量；Runner 与控制器只写值，字段语义在此集中维护。
 
 SCHEDULER_TRACE_FIELDS = [
-    "virtual_time",              # 调度器处理 CLIENT_UPLOAD 的虚拟时间
+    "virtual_time", "decision_id", # 调度器处理 CLIENT_UPLOAD 的虚拟时间
     "client_round_idx",          # 该客户端第几次 dispatch（从 0 递增）
     "global_timestamp",          # 处理完该上传后的全局模型版本号；未触发聚合时可能不变
     "client_id",
@@ -77,6 +77,7 @@ GROUP_TRACE_FIELDS = [
     "trigger",                   # all_arrived | deadline
     "merged_general_buffer",     # 是否合并了迟到缓冲（0/1）
     "per_client_staleness",      # JSON：组内各客户端聚合 staleness
+    "time_source", "anchor_client_id", "anchor_q",
 ]
 
 AGGREGATION_TRACE_FIELDS = [
@@ -89,13 +90,14 @@ AGGREGATION_TRACE_FIELDS = [
     "per_client_staleness",      # JSON：聚合权重依据的真实陈旧度
     "per_client_local_steps",
     "per_client_model_version",  # JSON：各客户端训练起始全局版本
+    "per_client_decision_id",
     "group_id",                  # FedCompass group；-1 表示非组聚合
     "num_clients",
     "client_update_budget_delta",  # 本次消耗的客户端更新贡献预算
 ]
 
 DISPATCH_DECISION_TRACE_FIELDS = [
-    "virtual_time",              # 做出本次分组/Q 决策的虚拟时间
+    "virtual_time", "decision_id", # 做出本次分组/Q 决策的虚拟时间
     "client_id",
     "decision",                  # first_group | join_group | create_group
     "assigned_group",            # 被分配到的 group_id
@@ -161,7 +163,7 @@ RUP_TRACE_FIELDS = [
 ]
 
 RUP_OUTCOME_TRACE_FIELDS = [
-    "dispatch_id", "client_dispatch_idx", "client_id", "dispatch_time",
+    "dispatch_id", "client_dispatch_idx", "client_id", "profile_type", "dispatch_time",
     "upload_time", "assigned_group", "baseline_q", "applied_q",
     "predicted_duration", "safe_duration", "actual_duration",
     "prediction_error", "absolute_prediction_error", "relative_prediction_error",
@@ -175,6 +177,48 @@ RUP_TRAINING_TRACE_FIELDS = [
     "loss_before", "loss_after", "loss_delta", "loss_delta_per_step",
     "prox_mu", "mean_prox_penalty", "mean_base_loss", "num_observed_batches",
     "finite",
+]
+
+STATE_TIME_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "q", "predictor_name",
+    "predictor_source", "num_reports", "used_fallback", "fallback_reason",
+    "predicted_duration", "safe_duration", "predicted_finish_time",
+    "safe_finish_time", "uncertainty", "compute_duration",
+    "communication_duration", "spike_duration", "availability_duration",
+    "availability_risk_duration", "curve_monotonic", "is_fedcompass_q",
+    "is_state_selected_q", "is_qmin", "is_qmax",
+]
+
+JOINT_GROUP_Q_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "mode", "applied",
+    "num_active_groups", "num_total_candidates", "num_deadline_safe_candidates",
+    "num_target_aligned_candidates", "fedcompass_group_id", "fedcompass_q",
+    "fedcompass_predicted_finish", "fedcompass_safe_finish",
+    "fedcompass_state_safe", "fedcompass_alignment_error", "state_group_id",
+    "state_q", "state_predicted_finish", "state_safe_finish", "state_safe",
+    "state_alignment_error", "state_safe_slack", "applied_group_id", "applied_q",
+    "group_changed", "q_changed", "state_only_feasible_group_found",
+    "all_existing_groups_infeasible", "selection_reason", "predictor_source",
+    "num_reports", "curve_monotonic", "state_control_active",
+    "fallback_to_fedcompass",
+]
+
+JOINT_GROUP_Q_CANDIDATE_TRACE_FIELDS = [
+    "decision_id", "client_id", "group_id", "q", "expected_arrival_time",
+    "latest_arrival_time", "predicted_finish_time", "safe_finish_time",
+    "uncertainty", "alignment_error", "safe_slack", "target_tolerance",
+    "deadline_safe", "target_aligned", "expected_already_passed",
+    "predictor_source", "num_reports", "selected_by_state",
+]
+
+STATE_GROUP_CREATION_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "new_group_id",
+    "new_group_window_mode", "new_group_q_mode", "applied",
+    "fedcompass_reference_q", "fedcompass_expected_time", "fedcompass_latest_time",
+    "state_assigned_q", "state_expected_time", "state_latest_time",
+    "state_safe_finish", "state_uncertainty", "expected_shift", "latest_shift",
+    "predictor_source", "num_reports", "used_fallback", "fallback_reason",
+    "safe_window_exceeds_cap",
 ]
 
 STATE_Q_TRACE_FIELDS = [
@@ -340,6 +384,7 @@ GLOBAL_EVAL_TRACE_FIELDS = [
 
 ROUND_REPORT_FIELDS = [
     "client_round_idx",
+    "decision_id",
     "client_id",
     "profile_type",
     "dispatch_time",             # 客户端本轮收到任务的虚拟时间
@@ -471,6 +516,10 @@ class TraceWriter:
         self.rup_outcome_rows: List[Dict[str, Any]] = []
         self.rup_terminal_state: Optional[Dict[str, Any]] = None
         self.rup_training_rows: List[Dict[str, Any]] = []
+        self.state_time_rows: List[Dict[str, Any]] = []
+        self.joint_group_q_rows: List[Dict[str, Any]] = []
+        self.joint_group_q_candidate_rows: List[Dict[str, Any]] = []
+        self.state_group_creation_rows: List[Dict[str, Any]] = []
         self.state_q_rows: List[Dict[str, Any]] = []
         self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
         self.group_recommendation_shadow_rows: List[Dict[str, Any]] = []
@@ -510,6 +559,7 @@ class TraceWriter:
         next_group_id: int = -1,
         model_version_at_upload: int = 0,
         runtime_state=None,
+        decision_id: str = "",
     ) -> None:
         """记录一条 scheduler_trace 行（CLIENT_UPLOAD 处理时刻）。
 
@@ -524,6 +574,7 @@ class TraceWriter:
 
         self.scheduler_rows.append({
             "virtual_time": virtual_time,
+            "decision_id": decision_id,
             "client_round_idx": client_round_idx,
             "global_timestamp": global_timestamp,
             "client_id": client_id,
@@ -580,6 +631,18 @@ class TraceWriter:
     def record_rup_outcome(self, row: Dict[str, Any]) -> None:
         """Record realized duration and deadline outcome for one RUP dispatch."""
         self.rup_outcome_rows.append(row)
+
+    def record_state_time(self, row: Dict[str, Any]) -> None:
+        self.state_time_rows.append(row)
+
+    def record_joint_group_q(self, row: Dict[str, Any]) -> None:
+        self.joint_group_q_rows.append(row)
+
+    def record_joint_group_q_candidate(self, row: Dict[str, Any]) -> None:
+        self.joint_group_q_candidate_rows.append(row)
+
+    def record_state_group_creation(self, row: Dict[str, Any]) -> None:
+        self.state_group_creation_rows.append(row)
 
     def set_rup_terminal_state(self, row: Dict[str, Any]) -> None:
         self.rup_terminal_state = dict(row)
@@ -692,6 +755,7 @@ class TraceWriter:
         profile_type: str,
         client_round_idx: int,
         model_version_at_dispatch: int = 0,
+        decision_id: str = "",
     ) -> None:
         """记录一条 per-client round_report 行（训练完成、事件入队时）。
 
@@ -704,6 +768,7 @@ class TraceWriter:
             self.round_report_rows[client_id] = []
         self.round_report_rows[client_id].append({
             "client_round_idx": client_round_idx,
+            "decision_id": decision_id,
             "client_id": client_id,
             "profile_type": profile_type,
             "dispatch_time": report.dispatch_time,
@@ -745,6 +810,7 @@ class TraceWriter:
         upload_group_id: int,
         next_group_id: int,
         speed_smoothed_at_upload: float,
+        decision_id: str = "",
     ) -> None:
         """在 CLIENT_UPLOAD 处理后回写 upload 相关字段。
 
@@ -761,6 +827,7 @@ class TraceWriter:
                 row["upload_group_id"] = upload_group_id
                 row["next_group_id"] = next_group_id
                 row["speed_smoothed_at_upload"] = speed_smoothed_at_upload
+                row["decision_id"] = decision_id or row.get("decision_id", "")
                 break
 
     def record_state_trace(self, client_id: str, state, profile_type: str, client_round_idx: int) -> None:
@@ -847,6 +914,22 @@ class TraceWriter:
                 self.output_dir / "rup_training_trace.csv",
                 self.rup_training_rows,
                 RUP_TRAINING_TRACE_FIELDS,
+            )
+        if self.state_time_rows:
+            _write_csv(self.output_dir / "state_time_trace.csv", self.state_time_rows, STATE_TIME_TRACE_FIELDS)
+        if self.joint_group_q_rows:
+            _write_csv(self.output_dir / "joint_group_q_trace.csv", self.joint_group_q_rows, JOINT_GROUP_Q_TRACE_FIELDS)
+        if self.joint_group_q_candidate_rows:
+            _write_csv(
+                self.output_dir / "joint_group_q_candidate_trace.csv",
+                self.joint_group_q_candidate_rows,
+                JOINT_GROUP_Q_CANDIDATE_TRACE_FIELDS,
+            )
+        if self.state_group_creation_rows:
+            _write_csv(
+                self.output_dir / "state_group_creation_trace.csv",
+                self.state_group_creation_rows,
+                STATE_GROUP_CREATION_TRACE_FIELDS,
             )
         if self.state_q_rows:
             _write_csv(

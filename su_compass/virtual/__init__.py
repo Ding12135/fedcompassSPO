@@ -12,4 +12,12 @@ su_compass.virtual — 虚拟时间实验核心层。
 """
 
 from .event import VirtualEvent, EventQueue, EventType  # noqa: F401
-from .client_runtime import VirtualClientRuntime  # noqa: F401
+
+
+def __getattr__(name):
+    # Keep lightweight scheduling/trace modules importable in environments
+    # without the optional torch training runtime (notably policy unit tests).
+    if name == "VirtualClientRuntime":
+        from .client_runtime import VirtualClientRuntime
+        return VirtualClientRuntime
+    raise AttributeError(name)

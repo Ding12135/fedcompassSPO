@@ -51,6 +51,7 @@ class Dispatch:
         "client_id", "global_model", "dispatch_time",
         "local_steps", "target_arrival_time", "latest_arrival_time",
         "staleness", "model_version_at_dispatch",
+        "decision_id",
     )
 
     def __init__(
@@ -63,6 +64,7 @@ class Dispatch:
         latest_arrival_time: Optional[float] = None,
         staleness: int = 0,
         model_version_at_dispatch: int = 0,
+        decision_id: str = "",
     ) -> None:
         self.client_id = client_id
         self.global_model = global_model
@@ -72,6 +74,7 @@ class Dispatch:
         self.latest_arrival_time = latest_arrival_time   # FedCompass：迟到判据阈值
         self.staleness = staleness                       # 派发瞬间的版本差，不等同于聚合瞬间 staleness
         self.model_version_at_dispatch = model_version_at_dispatch  # 本地训练起点版本
+        self.decision_id = decision_id
 
 
 class VirtualAlgorithmController(abc.ABC):
