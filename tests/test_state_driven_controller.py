@@ -1,10 +1,14 @@
 import copy
 import unittest
+from types import SimpleNamespace
+from tempfile import TemporaryDirectory
 
 from su_compass.scheduling.state_driven_config import StateDrivenConfig
 from su_compass.scheduling.state_time_model import QTimeCandidate
 from su_compass.virtual.algorithms.fedcompass import VirtualFedCompassController
 from su_compass.virtual.algorithms.state_driven_compass import VirtualStateDrivenCompassController
+from su_compass.virtual.event import EventType, VirtualEvent
+from su_compass.virtual.trace import TraceWriter
 
 
 class _FakeTimeModel:
@@ -126,6 +130,90 @@ class StateDrivenControllerTest(unittest.TestCase):
         trace = controller.pop_joint_group_q_traces()[0]
         self.assertEqual(trace["fallback_to_fedcompass"], 1)
         self.assertEqual(trace["state_control_active"], 0)
+
+    def test_calibrated_predictor_shadow_closes_on_real_outcome(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller._append_dispatch("client_0", 5.0, 100, 15.0, 17.0)
+        decision_id = controller.client_info["client_0"]["decision_id"]
+        report = SimpleNamespace(
+            round_time=12.0, local_steps=100, train_time=10.0,
+            communication_time=2.0, spike_delay=0.0, availability_wait=0.0,
+        )
+        controller._close_shadow_outcomes(VirtualEvent(
+            time=17.0, event_type=EventType.CLIENT_UPLOAD, client_id="client_0",
+            payload={"decision_id": decision_id, "report": report},
+        ))
+        row = controller.pop_calibrated_predictor_shadow_traces()[0]
+        self.assertEqual(row["actual_duration"], 12.0)
+        self.assertIn("safe_prediction_better", row)
+        with TemporaryDirectory() as directory:
+            writer = TraceWriter(directory, "state_driven_compass")
+            writer.record_calibrated_predictor_shadow(row)
+            writer.flush()
+
+    def test_predictor_native_new_group_shadow_has_outcome(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller.arrival_group = {
+            3: {"clients": ["client_0"], "arrived_clients": [],
+                "expected_arrival_time": 15.0, "latest_arrival_time": 18.0}
+        }
+        controller._record_predictor_native_group_shadow(
+            client_id="client_0", applied_q=100, fed_reference_q=100,
+        )
+        decision_id = controller.client_info["client_0"]["decision_id"]
+        report = SimpleNamespace(
+            round_time=12.0, local_steps=100, train_time=10.0,
+            communication_time=2.0, spike_delay=0.0, availability_wait=0.0,
+        )
+        controller._close_shadow_outcomes(VirtualEvent(
+            time=17.0, event_type=EventType.CLIENT_UPLOAD, client_id="client_0",
+            payload={"decision_id": decision_id, "report": report},
+        ))
+        row = controller.pop_predictor_native_group_shadow_traces()[0]
+        self.assertEqual(row["applied_q"], 100)
+        self.assertIn("counterfactual_actual_duration", row)
+        self.assertIn("native_prediction_better", row)
+        with TemporaryDirectory() as directory:
+            writer = TraceWriter(directory, "state_driven_compass")
+            writer.record_predictor_native_group_shadow(row)
+            writer.flush()
+
+    def test_fixed_q_state_window_applies_fedcompass_reference_q(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=2, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                existing_group_mode="state_apply",
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass",
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller.client_info["client_1"] = {
+            "speed": 0.02, "timestamp": 0, "local_steps": 100, "goa": 7,
+        }
+        controller.arrival_group = {
+            7: {"clients": ["client_1"], "arrived_clients": [],
+                "expected_arrival_time": 9.0, "latest_arrival_time": 10.0}
+        }
+        controller._create_group("client_0")
+        self.assertEqual(controller.client_info["client_0"]["local_steps"], 90)
+        row = controller.pop_state_group_creation_traces()[0]
+        self.assertEqual(row["fedcompass_reference_q"], 90)
+        self.assertEqual(row["state_assigned_q"], 90)
 
 
 if __name__ == "__main__":

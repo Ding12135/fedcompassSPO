@@ -18,6 +18,7 @@ PRESETS = {
     "state_driven_shadow": ("state_shadow", "state_shadow_fixed_q", "fedcompass", "full"),
     "state_driven_join": ("state_apply", "fedcompass", "fedcompass", "summary"),
     "state_driven_fixed_q_window": ("state_apply", "state_apply_fixed_q", "fedcompass", "summary"),
+    "state_driven_safe_reuse_v1": ("state_apply", "state_apply_fixed_q", "fedcompass", "summary"),
     "state_driven_full": ("state_apply", "state_apply", "qmax_anchor", "summary"),
 }
 

@@ -196,7 +196,8 @@ JOINT_GROUP_Q_TRACE_FIELDS = [
     "fedcompass_predicted_finish", "fedcompass_safe_finish",
     "fedcompass_state_safe", "fedcompass_alignment_error", "state_group_id",
     "state_q", "state_predicted_finish", "state_safe_finish", "state_safe",
-    "state_alignment_error", "state_safe_slack", "applied_group_id", "applied_q",
+    "state_alignment_error", "state_safe_slack", "state_group_size_before",
+    "applied_group_id", "applied_q",
     "group_changed", "q_changed", "state_only_feasible_group_found",
     "all_existing_groups_infeasible", "selection_reason", "predictor_source",
     "num_reports", "curve_monotonic", "state_control_active",
@@ -204,7 +205,7 @@ JOINT_GROUP_Q_TRACE_FIELDS = [
 ]
 
 JOINT_GROUP_Q_CANDIDATE_TRACE_FIELDS = [
-    "decision_id", "client_id", "group_id", "q", "expected_arrival_time",
+    "decision_id", "client_id", "group_id", "group_size", "q", "expected_arrival_time",
     "latest_arrival_time", "predicted_finish_time", "safe_finish_time",
     "uncertainty", "alignment_error", "safe_slack", "target_tolerance",
     "deadline_safe", "target_aligned", "expected_already_passed",
@@ -219,6 +220,30 @@ STATE_GROUP_CREATION_TRACE_FIELDS = [
     "state_safe_finish", "state_uncertainty", "expected_shift", "latest_shift",
     "predictor_source", "num_reports", "used_fallback", "fallback_reason",
     "safe_window_exceeds_cap",
+]
+
+CALIBRATED_PREDICTOR_SHADOW_TRACE_FIELDS = [
+    "decision_id", "client_id", "profile_type", "dispatch_time", "q", "predictor_source",
+    "num_reports", "baseline_duration", "baseline_safe_duration",
+    "shadow_duration", "shadow_safe_duration", "shadow_conformal_margin",
+    "shadow_used_candidate", "shadow_burst_probability", "actual_duration",
+    "baseline_abs_error", "shadow_abs_error", "baseline_safe_hit",
+    "shadow_safe_hit", "baseline_pinball", "shadow_pinball",
+    "point_prediction_better", "safe_prediction_better",
+]
+
+PREDICTOR_NATIVE_GROUP_SHADOW_TRACE_FIELDS = [
+    "decision_id", "client_id", "profile_type", "dispatch_time", "num_active_groups",
+    "source_group_id", "next_target_time", "fastest_predictor_source",
+    "curve_monotonic", "fedcompass_reference_q", "applied_q",
+    "applied_predicted_duration", "applied_safe_duration",
+    "applied_expected_time", "applied_latest_time", "native_q",
+    "native_predicted_duration", "native_safe_duration", "native_expected_time",
+    "native_latest_time", "native_predictor_source", "native_num_reports",
+    "native_used_fallback", "native_q_changed", "native_qmax",
+    "actual_applied_duration", "counterfactual_actual_duration",
+    "applied_abs_error", "native_abs_error", "native_safe_hit",
+    "native_prediction_better", "native_reduces_qmax",
 ]
 
 STATE_Q_TRACE_FIELDS = [
@@ -520,6 +545,8 @@ class TraceWriter:
         self.joint_group_q_rows: List[Dict[str, Any]] = []
         self.joint_group_q_candidate_rows: List[Dict[str, Any]] = []
         self.state_group_creation_rows: List[Dict[str, Any]] = []
+        self.calibrated_predictor_shadow_rows: List[Dict[str, Any]] = []
+        self.predictor_native_group_shadow_rows: List[Dict[str, Any]] = []
         self.state_q_rows: List[Dict[str, Any]] = []
         self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
         self.group_recommendation_shadow_rows: List[Dict[str, Any]] = []
@@ -643,6 +670,12 @@ class TraceWriter:
 
     def record_state_group_creation(self, row: Dict[str, Any]) -> None:
         self.state_group_creation_rows.append(row)
+
+    def record_calibrated_predictor_shadow(self, row: Dict[str, Any]) -> None:
+        self.calibrated_predictor_shadow_rows.append(row)
+
+    def record_predictor_native_group_shadow(self, row: Dict[str, Any]) -> None:
+        self.predictor_native_group_shadow_rows.append(row)
 
     def set_rup_terminal_state(self, row: Dict[str, Any]) -> None:
         self.rup_terminal_state = dict(row)
@@ -930,6 +963,18 @@ class TraceWriter:
                 self.output_dir / "state_group_creation_trace.csv",
                 self.state_group_creation_rows,
                 STATE_GROUP_CREATION_TRACE_FIELDS,
+            )
+        if self.calibrated_predictor_shadow_rows:
+            _write_csv(
+                self.output_dir / "calibrated_predictor_shadow_trace.csv",
+                self.calibrated_predictor_shadow_rows,
+                CALIBRATED_PREDICTOR_SHADOW_TRACE_FIELDS,
+            )
+        if self.predictor_native_group_shadow_rows:
+            _write_csv(
+                self.output_dir / "predictor_native_group_shadow_trace.csv",
+                self.predictor_native_group_shadow_rows,
+                PREDICTOR_NATIVE_GROUP_SHADOW_TRACE_FIELDS,
             )
         if self.state_q_rows:
             _write_csv(

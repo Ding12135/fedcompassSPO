@@ -347,6 +347,14 @@ def run_experiment(args: argparse.Namespace) -> None:
             for row in controller.pop_state_group_creation_traces():
                 trace.record_state_group_creation(row)
 
+        if hasattr(controller, "pop_calibrated_predictor_shadow_traces"):
+            for row in controller.pop_calibrated_predictor_shadow_traces():
+                trace.record_calibrated_predictor_shadow(row)
+
+        if hasattr(controller, "pop_predictor_native_group_shadow_traces"):
+            for row in controller.pop_predictor_native_group_shadow_traces():
+                trace.record_predictor_native_group_shadow(row)
+
         if hasattr(controller, "pop_state_q_traces"):
             for state_q in controller.pop_state_q_traces():
                 trace.record_state_q_decision(state_q)
@@ -772,6 +780,10 @@ def _state_driven_config_from_args(args) -> StateDrivenConfig:
         new_group_q_mode=args.sd_new_group_q_mode,
         candidate_trace_level=args.sd_candidate_trace_level,
         target_band_ratio=args.sd_target_band_ratio,
+        alignment_equivalence_band=args.sd_alignment_equivalence_band,
+        calibrated_predictor_shadow=args.sd_calibrated_predictor_shadow == "on",
+        predictor_native_new_group_shadow=args.sd_predictor_native_new_group_shadow == "on",
+        calibrated_shadow_target_coverage=args.sd_calibrated_shadow_target_coverage,
         min_group_slack=args.sd_min_group_slack,
         max_group_slack=args.sd_max_group_slack,
     )
@@ -967,6 +979,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sd_new_group_q_mode", choices=["fedcompass", "qmax_anchor"], default="qmax_anchor")
     parser.add_argument("--sd_candidate_trace_level", choices=["none", "summary", "full"], default="summary")
     parser.add_argument("--sd_target_band_ratio", type=float, default=0.05)
+    parser.add_argument("--sd_alignment_equivalence_band", type=float, default=0.5)
+    parser.add_argument("--sd_calibrated_predictor_shadow", choices=["on", "off"], default="on")
+    parser.add_argument("--sd_predictor_native_new_group_shadow", choices=["on", "off"], default="on")
+    parser.add_argument("--sd_calibrated_shadow_target_coverage", type=float, default=0.85)
     parser.add_argument("--sd_min_group_slack", type=float, default=0.5)
     parser.add_argument("--sd_max_group_slack", type=float, default=120.0)
 
