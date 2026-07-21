@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any, Dict, List
 
 from su_compass.scheduling.fedcompass_reference import (
@@ -10,6 +11,10 @@ from su_compass.scheduling.fedcompass_reference import (
     new_group_reference_window,
 )
 from su_compass.scheduling.policies.joint_group_q import JointGroupQPolicy
+from su_compass.scheduling.policies.lyapunov_group_q import (
+    LyapunovAction,
+    LyapunovGroupQPolicy,
+)
 from su_compass.scheduling.predictors.regime_calibrated import RegimeCalibratedPredictor
 from su_compass.scheduling.state_time_model import StateTimeModel, state_group_window
 from su_compass.scheduling.state_driven_config import StateDrivenConfig
@@ -38,6 +43,36 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         self._native_group_shadow_trace_buffer: List[dict] = []
         self._pending_calibrated_shadow: Dict[str, dict] = {}
         self._pending_native_group_shadow: Dict[str, dict] = {}
+        self._lyapunov_policy = LyapunovGroupQPolicy(
+            rhythm_target=state_driven_config.lyapunov_rhythm_target,
+            tradeoff_v=state_driven_config.lyapunov_v,
+            max_holding_wait=state_driven_config.lyapunov_max_holding_wait,
+            q_trust_eta=state_driven_config.lyapunov_q_trust_eta,
+            create_penalty=state_driven_config.lyapunov_create_penalty,
+            enable_rhythm_queue=state_driven_config.lyapunov_enable_rhythm_queue,
+            enable_workload_queue=state_driven_config.lyapunov_enable_workload_queue,
+        )
+        self._lyapunov_rhythm_debt = 0.0
+        self._lyapunov_workload_debt: Dict[str, float] = {}
+        self._lyapunov_target_rates = self._parse_target_rates(
+            state_driven_config.lyapunov_client_target_rates
+        )
+        self._lyapunov_last_aggregation_time = 0.0
+        self._lyapunov_decision_trace_buffer: List[dict] = []
+        self._lyapunov_queue_trace_buffer: List[dict] = []
+
+    @staticmethod
+    def _parse_target_rates(spec: str) -> Dict[str, float]:
+        rates: Dict[str, float] = {}
+        if not spec.strip():
+            return rates
+        for item in spec.split(","):
+            client_id, value = item.split("=", 1)
+            rate = float(value)
+            if rate < 0:
+                raise ValueError("Lyapunov client target rates must be non-negative")
+            rates[client_id.strip()] = rate
+        return rates
 
     @property
     def algorithm_name(self) -> str:
@@ -350,6 +385,11 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
 
     def _assign_group(self, client_id: str) -> List[VirtualEvent]:
         self._prepare_next_decision(client_id)
+        if self.state_driven_config.lyapunov_mode != "off":
+            return self._assign_group_lyapunov(client_id)
+        return self._assign_group_safe_reuse(client_id)
+
+    def _assign_group_safe_reuse(self, client_id: str) -> List[VirtualEvent]:
         cfg = self.state_driven_config
         if not self.arrival_group:
             if cfg.new_group_window_mode == "state_shadow_fixed_q":
@@ -362,6 +402,196 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         if self._join_group(client_id):
             return []
         return self._create_group(client_id)
+
+    def _lyapunov_actions(self, client_id: str):
+        curve, monotonic = self._curve(client_id)
+        speed = float(self.client_info[client_id]["speed"])
+        fed_join = existing_group_reference(
+            now=self._virtual_now, speed=speed, groups=self.arrival_group,
+            qmin=self.min_local_steps, qmax=self.max_local_steps,
+        )
+        joint = self._joint_policy.enumerate_candidates(
+            now=self._virtual_now, groups=self.arrival_group, curve=curve,
+        )
+        actions = []
+        for candidate in joint:
+            frontier = candidate.expected_arrival_time
+            holding = max(0.0, frontier - candidate.predicted_finish_time)
+            external = max(0.0, candidate.predicted_finish_time - frontier)
+            actions.append(LyapunovAction(
+                mode="join", group_id=candidate.group_id, q=candidate.q,
+                predicted_finish_time=candidate.predicted_finish_time,
+                safe_finish_time=candidate.safe_finish_time,
+                group_frontier_time=frontier,
+                latest_arrival_time=candidate.latest_arrival_time,
+                deadline_safe=candidate.deadline_safe,
+                holding_wait=holding, external_wait=external,
+                predicted_sojourn=max(frontier, candidate.predicted_finish_time) - self._virtual_now,
+                effective_work=candidate.q / self.max_local_steps,
+                utility=math.log1p(candidate.q / max(self.min_local_steps, 1)),
+            ))
+        fed_new_q = new_group_reference_q(
+            now=self._virtual_now, client_id=client_id, speed=speed,
+            groups=self.arrival_group, client_info=self.client_info,
+            qmin=self.min_local_steps, qmax=self.max_local_steps,
+        ) if self.arrival_group else self.max_local_steps
+        create_point = next((point for point in curve if point.q == fed_new_q), curve[-1])
+        actions.append(LyapunovAction(
+            mode="create", group_id=-1, q=fed_new_q,
+            predicted_finish_time=create_point.predicted_finish_time,
+            safe_finish_time=create_point.safe_finish_time,
+            group_frontier_time=create_point.predicted_finish_time,
+            latest_arrival_time=create_point.safe_finish_time,
+            deadline_safe=True, holding_wait=0.0, external_wait=0.0,
+            predicted_sojourn=create_point.predicted_duration,
+            effective_work=fed_new_q / self.max_local_steps,
+            utility=math.log1p(fed_new_q / max(self.min_local_steps, 1)),
+        ))
+        scored = self._lyapunov_policy.score(
+            actions,
+            rhythm_debt=self._lyapunov_rhythm_debt,
+            workload_debt=self._lyapunov_workload_debt.get(client_id, 0.0),
+            qmax=self.max_local_steps, qmin=self.min_local_steps,
+            fedcompass_join_q=fed_join.q if fed_join.feasible else -1,
+        )
+        return curve, monotonic, fed_join, fed_new_q, scored, self._lyapunov_policy.choose(scored)
+
+    def _record_lyapunov_decision(
+        self, client_id: str, scored, decision, *, applied_mode: str,
+        applied_group: int, applied_q: int,
+    ) -> None:
+        selected = decision.action if decision.feasible else None
+        legal = [action for action in scored if action.legal]
+        rejected_holding = sum(
+            action.rejection_reason == "holding_wait_exceeds_cap" for action in scored
+        )
+        rejected_q = sum(action.rejection_reason == "q_exceeds_trust_region" for action in scored)
+        self._lyapunov_decision_trace_buffer.append({
+            "decision_id": self._decision_id(client_id),
+            "virtual_time": self._virtual_now,
+            "client_id": client_id,
+            "mode": self.state_driven_config.lyapunov_mode,
+            "rhythm_debt": self._lyapunov_rhythm_debt,
+            "workload_debt": self._lyapunov_workload_debt.get(client_id, 0.0),
+            "num_actions": len(scored), "num_legal_actions": len(legal),
+            "rejected_holding_actions": rejected_holding,
+            "rejected_q_actions": rejected_q,
+            "recommended_mode": selected.mode if selected else "",
+            "recommended_group_id": selected.group_id if selected else -1,
+            "recommended_q": selected.q if selected else -1,
+            "recommended_score": selected.score if selected else "",
+            "recommended_sojourn": selected.predicted_sojourn if selected else "",
+            "recommended_holding_wait": selected.holding_wait if selected else "",
+            "recommended_external_wait": selected.external_wait if selected else "",
+            "applied_mode": applied_mode, "applied_group_id": applied_group,
+            "applied_q": applied_q,
+            "recommendation_applied": int(
+                selected is not None and selected.mode == applied_mode
+                and selected.q == applied_q
+                and (selected.mode == "create" or selected.group_id == applied_group)
+            ),
+        })
+
+    def _apply_lyapunov_join(self, client_id: str, action: LyapunovAction) -> None:
+        group = self.arrival_group[action.group_id]
+        group["clients"].append(client_id)
+        self.client_info[client_id]["goa"] = action.group_id
+        self.client_info[client_id]["local_steps"] = action.q
+        self.client_info[client_id]["start_time"] = self._virtual_now
+        self._record_dispatch_decision(
+            client_id=client_id, decision="lyapunov_join_group",
+            assigned_group=action.group_id, assigned_steps=action.q,
+            speed_raw=float(self.client_info[client_id]["speed"]),
+            remaining_time=group["expected_arrival_time"] - self._virtual_now,
+            target_arrival=group["expected_arrival_time"],
+            latest_arrival=group["latest_arrival_time"],
+        )
+
+    def _assign_group_lyapunov(self, client_id: str) -> List[VirtualEvent]:
+        curve, monotonic, fed_join, fed_new_q, scored, decision = self._lyapunov_actions(client_id)
+        fallback = bool(curve) and all(point.used_fallback for point in curve)
+        if fallback or not decision.feasible:
+            events = self._assign_group_safe_reuse(client_id)
+            group = int(self.client_info[client_id].get("goa", -1))
+            q = int(self.client_info[client_id].get("local_steps", -1))
+            self._record_lyapunov_decision(
+                client_id, scored, decision, applied_mode="fallback",
+                applied_group=group, applied_q=q,
+            )
+            return events
+
+        if self.state_driven_config.lyapunov_mode == "shadow":
+            events = self._assign_group_safe_reuse(client_id)
+            group = int(self.client_info[client_id].get("goa", -1))
+            q = int(self.client_info[client_id].get("local_steps", -1))
+            applied_mode = "join" if not events else "create"
+            self._record_lyapunov_decision(
+                client_id, scored, decision, applied_mode=applied_mode,
+                applied_group=group, applied_q=q,
+            )
+            return events
+
+        action = decision.action
+        assert action is not None
+        if action.mode == "join":
+            self._apply_lyapunov_join(client_id, action)
+            events: List[VirtualEvent] = []
+            group = action.group_id
+        else:
+            events = self._create_state_group(
+                client_id, action.q, fed_reference_q=fed_new_q,
+            )
+            group = int(self.client_info[client_id]["goa"])
+        self._record_state_time_points(
+            client_id, curve, action.q, fed_join.q, monotonic,
+        )
+        self._record_lyapunov_decision(
+            client_id, scored, decision, applied_mode=action.mode,
+            applied_group=group, applied_q=action.q,
+        )
+        return events
+
+    def _record_aggregation_trace(
+        self, trigger, participating, local_steps, model_versions,
+        decision_ids, group_id, budget_delta, ts_before,
+    ) -> None:
+        super()._record_aggregation_trace(
+            trigger, participating, local_steps, model_versions,
+            decision_ids, group_id, budget_delta, ts_before,
+        )
+        if self.state_driven_config.lyapunov_mode == "off":
+            return
+        delta_t = max(0.0, self._virtual_now - self._lyapunov_last_aggregation_time)
+        before_h = self._lyapunov_rhythm_debt
+        if self.state_driven_config.lyapunov_enable_rhythm_queue:
+            self._lyapunov_rhythm_debt = max(
+                0.0, before_h + delta_t - self.state_driven_config.lyapunov_rhythm_target
+            )
+        for client_id in getattr(self, "_client_ids", []):
+            before_z = self._lyapunov_workload_debt.get(client_id, 0.0)
+            target = self._lyapunov_target_rates.get(client_id, 0.0) * delta_t
+            service = 0.0
+            if client_id in local_steps:
+                service = (
+                    float(local_steps[client_id]) / self.max_local_steps
+                    / (1.0 + float(participating[client_id]))
+                )
+            after_z = max(0.0, before_z + target - service) if (
+                self.state_driven_config.lyapunov_enable_workload_queue
+            ) else before_z
+            self._lyapunov_workload_debt[client_id] = after_z
+            self._lyapunov_queue_trace_buffer.append({
+                "aggregation_id": ts_before + 1,
+                "virtual_time": self._virtual_now, "delta_t": delta_t,
+                "client_id": client_id, "rhythm_debt_before": before_h,
+                "rhythm_debt_after": self._lyapunov_rhythm_debt,
+                "workload_debt_before": before_z,
+                "target_workload_arrival": target,
+                "effective_work_service": service,
+                "workload_debt_after": after_z,
+                "participated": int(client_id in local_steps),
+            })
+        self._lyapunov_last_aggregation_time = self._virtual_now
 
     def _create_group(self, client_id: str) -> List[VirtualEvent]:
         cfg = self.state_driven_config
@@ -607,4 +837,12 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
 
     def pop_predictor_native_group_shadow_traces(self):
         rows, self._native_group_shadow_trace_buffer = self._native_group_shadow_trace_buffer, []
+        return rows
+
+    def pop_lyapunov_decision_traces(self):
+        rows, self._lyapunov_decision_trace_buffer = self._lyapunov_decision_trace_buffer, []
+        return rows
+
+    def pop_lyapunov_queue_traces(self):
+        rows, self._lyapunov_queue_trace_buffer = self._lyapunov_queue_trace_buffer, []
         return rows

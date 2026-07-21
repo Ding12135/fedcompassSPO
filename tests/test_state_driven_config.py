@@ -27,6 +27,13 @@ class StateDrivenConfigTest(unittest.TestCase):
                 new_group_q_mode="qmax_anchor",
             )
 
+    def test_lyapunov_is_default_off_and_modes_validate(self):
+        self.assertEqual(StateDrivenConfig().lyapunov_mode, "off")
+        StateDrivenConfig(lyapunov_mode="shadow")
+        StateDrivenConfig(lyapunov_mode="apply")
+        with self.assertRaises(ValueError):
+            StateDrivenConfig(lyapunov_mode="invalid")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,10 +22,38 @@ PRESETS = {
     "state_driven_full": ("state_apply", "state_apply", "qmax_anchor", "summary"),
 }
 
+# 0.8 x the frozen seed-2026 FedCompass staleness-adjusted workload rates.
+# These are experiment calibration inputs, not values learned from the
+# candidate run; the manifest records them verbatim for reproducibility.
+BASELINE_TARGET_RATES_08 = (
+    "client_0=0.041279,client_1=0.043813,client_2=0.007019,"
+    "client_3=0.025474,client_4=0.021321,client_5=0.000186,"
+    "client_6=0.000346,client_7=0.002284"
+)
+
+LYAPUNOV_PRESETS = {
+    "state_driven_lyapunov_shadow": ["--sd_lyapunov_mode", "shadow"],
+    "state_driven_lyapunov_v1": ["--sd_lyapunov_mode", "apply"],
+    "state_driven_lyapunov_no_h": [
+        "--sd_lyapunov_mode", "apply", "--sd_lyapunov_rhythm_queue", "off",
+    ],
+    "state_driven_lyapunov_no_z": [
+        "--sd_lyapunov_mode", "apply", "--sd_lyapunov_workload_queue", "off",
+    ],
+    "state_driven_lyapunov_no_holding_cap": [
+        "--sd_lyapunov_mode", "apply", "--sd_lyapunov_max_holding_wait", "1000000",
+    ],
+    "state_driven_lyapunov_no_qcap": [
+        "--sd_lyapunov_mode", "apply", "--sd_lyapunov_q_trust_eta", "1000000",
+    ],
+}
+for _preset in LYAPUNOV_PRESETS:
+    PRESETS[_preset] = ("state_apply", "state_apply_fixed_q", "fedcompass", "summary")
+
 
 def command_for(preset: str, budget: int, seed: int, output_dir: Path) -> list[str]:
     existing, window, new_q, trace_level = PRESETS[preset]
-    return [
+    command = [
         sys.executable, "-u", "-m", "su_compass.experiments.run_virtual_fl",
         "--algorithm", "state_driven_compass",
         "--server_config", "su_compass/config/virtual_fedcompass_cifar10_bn_partition_fix.yaml",
@@ -41,6 +69,17 @@ def command_for(preset: str, budget: int, seed: int, output_dir: Path) -> list[s
         "--sd_new_group_q_mode", new_q,
         "--sd_candidate_trace_level", trace_level,
     ]
+    if preset in LYAPUNOV_PRESETS:
+        command.extend([
+            "--sd_lyapunov_rhythm_target", "16.4",
+            "--sd_lyapunov_v", "1.0",
+            "--sd_lyapunov_max_holding_wait", "80.0",
+            "--sd_lyapunov_q_trust_eta", "1.1",
+            "--sd_lyapunov_create_penalty", "0.25",
+            "--sd_lyapunov_client_target_rates", BASELINE_TARGET_RATES_08,
+        ])
+        command.extend(LYAPUNOV_PRESETS[preset])
+    return command
 
 
 def run_with_live_log(command: list[str], *, cwd: Path, log_path: Path) -> int:

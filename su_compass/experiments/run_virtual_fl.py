@@ -355,6 +355,14 @@ def run_experiment(args: argparse.Namespace) -> None:
             for row in controller.pop_predictor_native_group_shadow_traces():
                 trace.record_predictor_native_group_shadow(row)
 
+        if hasattr(controller, "pop_lyapunov_decision_traces"):
+            for row in controller.pop_lyapunov_decision_traces():
+                trace.record_lyapunov_decision(row)
+
+        if hasattr(controller, "pop_lyapunov_queue_traces"):
+            for row in controller.pop_lyapunov_queue_traces():
+                trace.record_lyapunov_queue(row)
+
         if hasattr(controller, "pop_state_q_traces"):
             for state_q in controller.pop_state_q_traces():
                 trace.record_state_q_decision(state_q)
@@ -784,6 +792,15 @@ def _state_driven_config_from_args(args) -> StateDrivenConfig:
         calibrated_predictor_shadow=args.sd_calibrated_predictor_shadow == "on",
         predictor_native_new_group_shadow=args.sd_predictor_native_new_group_shadow == "on",
         calibrated_shadow_target_coverage=args.sd_calibrated_shadow_target_coverage,
+        lyapunov_mode=args.sd_lyapunov_mode,
+        lyapunov_rhythm_target=args.sd_lyapunov_rhythm_target,
+        lyapunov_v=args.sd_lyapunov_v,
+        lyapunov_max_holding_wait=args.sd_lyapunov_max_holding_wait,
+        lyapunov_q_trust_eta=args.sd_lyapunov_q_trust_eta,
+        lyapunov_create_penalty=args.sd_lyapunov_create_penalty,
+        lyapunov_enable_rhythm_queue=args.sd_lyapunov_rhythm_queue == "on",
+        lyapunov_enable_workload_queue=args.sd_lyapunov_workload_queue == "on",
+        lyapunov_client_target_rates=args.sd_lyapunov_client_target_rates,
         min_group_slack=args.sd_min_group_slack,
         max_group_slack=args.sd_max_group_slack,
     )
@@ -983,6 +1000,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sd_calibrated_predictor_shadow", choices=["on", "off"], default="on")
     parser.add_argument("--sd_predictor_native_new_group_shadow", choices=["on", "off"], default="on")
     parser.add_argument("--sd_calibrated_shadow_target_coverage", type=float, default=0.85)
+    parser.add_argument("--sd_lyapunov_mode", choices=["off", "shadow", "apply"], default="off")
+    parser.add_argument("--sd_lyapunov_rhythm_target", type=float, default=16.4)
+    parser.add_argument("--sd_lyapunov_v", type=float, default=1.0)
+    parser.add_argument("--sd_lyapunov_max_holding_wait", type=float, default=80.0)
+    parser.add_argument("--sd_lyapunov_q_trust_eta", type=float, default=1.1)
+    parser.add_argument("--sd_lyapunov_create_penalty", type=float, default=0.25)
+    parser.add_argument("--sd_lyapunov_rhythm_queue", choices=["on", "off"], default="on")
+    parser.add_argument("--sd_lyapunov_workload_queue", choices=["on", "off"], default="on")
+    parser.add_argument("--sd_lyapunov_client_target_rates", type=str, default="")
     parser.add_argument("--sd_min_group_slack", type=float, default=0.5)
     parser.add_argument("--sd_max_group_slack", type=float, default=120.0)
 

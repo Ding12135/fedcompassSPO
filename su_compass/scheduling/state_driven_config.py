@@ -20,6 +20,15 @@ class StateDrivenConfig:
     calibrated_predictor_shadow: bool = True
     predictor_native_new_group_shadow: bool = True
     calibrated_shadow_target_coverage: float = 0.85
+    lyapunov_mode: str = "off"
+    lyapunov_rhythm_target: float = 16.4
+    lyapunov_v: float = 1.0
+    lyapunov_max_holding_wait: float = 80.0
+    lyapunov_q_trust_eta: float = 1.1
+    lyapunov_create_penalty: float = 0.25
+    lyapunov_enable_rhythm_queue: bool = True
+    lyapunov_enable_workload_queue: bool = True
+    lyapunov_client_target_rates: str = ""
 
     def __post_init__(self) -> None:
         legal = {
@@ -44,3 +53,13 @@ class StateDrivenConfig:
             raise ValueError("max_group_slack must be >= min_group_slack")
         if not 0.5 < self.calibrated_shadow_target_coverage < 1.0:
             raise ValueError("calibrated shadow target coverage must be in (0.5, 1)")
+        if self.lyapunov_mode not in {"off", "shadow", "apply"}:
+            raise ValueError("lyapunov_mode must be off, shadow or apply")
+        if self.lyapunov_rhythm_target <= 0 or self.lyapunov_v < 0:
+            raise ValueError("Lyapunov rhythm target must be positive and V non-negative")
+        if (
+            self.lyapunov_max_holding_wait < 0
+            or self.lyapunov_q_trust_eta < 1.0
+            or self.lyapunov_create_penalty < 0
+        ):
+            raise ValueError("invalid Lyapunov constraint parameter")

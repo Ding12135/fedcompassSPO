@@ -54,6 +54,107 @@ def _base(controller):
 
 
 class StateDrivenControllerTest(unittest.TestCase):
+    def test_lyapunov_queue_updates_only_from_real_aggregation(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                lyapunov_mode="shadow", lyapunov_rhythm_target=10,
+                lyapunov_client_target_rates="client_0=0.1",
+            ),
+        ))
+        controller._client_ids = ["client_0"]
+        controller._virtual_now = 15
+        controller._record_aggregation_trace(
+            "single", {"client_0": 0}, {"client_0": 100},
+            {"client_0": 0}, {"client_0": "d"}, -1, 1, 0,
+        )
+        self.assertEqual(controller._lyapunov_rhythm_debt, 5)
+        self.assertEqual(controller._lyapunov_workload_debt["client_0"], 1.0)
+        row = controller.pop_lyapunov_queue_traces()[0]
+        self.assertEqual(row["delta_t"], 15)
+
+    def test_lyapunov_shadow_keeps_safe_reuse_action(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="shadow",
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller.arrival_group = {
+            0: {"clients": [], "arrived_clients": [],
+                "expected_arrival_time": 15.0, "latest_arrival_time": 28.0,
+                "created_time": 0.0}
+        }
+        controller._assign_group("client_0")
+        self.assertEqual(controller.client_info["client_0"]["goa"], 0)
+        trace = controller.pop_lyapunov_decision_traces()[0]
+        self.assertEqual(trace["mode"], "shadow")
+        self.assertEqual(trace["applied_mode"], "join")
+
+    def test_lyapunov_apply_can_create_instead_of_long_holding_join(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=2, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="apply",
+                lyapunov_max_holding_wait=100,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller._lyapunov_rhythm_debt = 100
+        controller.client_info["client_1"] = {
+            "speed": 0.1, "timestamp": 0, "local_steps": 200, "goa": 0,
+        }
+        controller.arrival_group = {
+            0: {"clients": ["client_1"], "arrived_clients": [],
+                "expected_arrival_time": 85.0, "latest_arrival_time": 100.0,
+                "created_time": 0.0}
+        }
+        controller.group_counter = 1
+        events = controller._assign_group("client_0")
+        self.assertTrue(events)
+        self.assertNotEqual(controller.client_info["client_0"]["goa"], 0)
+        trace = controller.pop_lyapunov_decision_traces()[0]
+        self.assertEqual(trace["recommended_mode"], "create")
+        self.assertEqual(trace["recommendation_applied"], 1)
+
+    def test_lyapunov_traces_flush_to_independent_files(self):
+        with TemporaryDirectory() as directory:
+            writer = TraceWriter(directory, "state_driven_compass")
+            writer.record_lyapunov_decision({
+                key: 0 for key in (
+                    "decision_id", "virtual_time", "client_id", "mode",
+                    "rhythm_debt", "workload_debt", "num_actions",
+                    "num_legal_actions", "rejected_holding_actions",
+                    "rejected_q_actions", "recommended_mode",
+                    "recommended_group_id", "recommended_q",
+                    "recommended_score", "recommended_sojourn",
+                    "recommended_holding_wait", "recommended_external_wait",
+                    "applied_mode", "applied_group_id", "applied_q",
+                    "recommendation_applied",
+                )
+            })
+            writer.record_lyapunov_queue({
+                key: 0 for key in (
+                    "aggregation_id", "virtual_time", "delta_t", "client_id",
+                    "rhythm_debt_before", "rhythm_debt_after",
+                    "workload_debt_before", "target_workload_arrival",
+                    "effective_work_service", "workload_debt_after",
+                    "participated",
+                )
+            })
+            writer.flush()
+            from pathlib import Path
+            self.assertTrue((Path(directory) / "lyapunov_decision_trace.csv").exists())
+            self.assertTrue((Path(directory) / "lyapunov_queue_trace.csv").exists())
     def test_state_group_uses_predicted_and_safe_finish(self):
         controller = _base(VirtualStateDrivenCompassController(
             aggregator=object(), num_clients=1, min_local_steps=40,

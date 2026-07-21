@@ -246,6 +246,23 @@ PREDICTOR_NATIVE_GROUP_SHADOW_TRACE_FIELDS = [
     "native_prediction_better", "native_reduces_qmax",
 ]
 
+LYAPUNOV_DECISION_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "mode",
+    "rhythm_debt", "workload_debt", "num_actions", "num_legal_actions",
+    "rejected_holding_actions", "rejected_q_actions",
+    "recommended_mode", "recommended_group_id", "recommended_q",
+    "recommended_score", "recommended_sojourn", "recommended_holding_wait",
+    "recommended_external_wait", "applied_mode", "applied_group_id",
+    "applied_q", "recommendation_applied",
+]
+
+LYAPUNOV_QUEUE_TRACE_FIELDS = [
+    "aggregation_id", "virtual_time", "delta_t", "client_id",
+    "rhythm_debt_before", "rhythm_debt_after", "workload_debt_before",
+    "target_workload_arrival", "effective_work_service",
+    "workload_debt_after", "participated",
+]
+
 STATE_Q_TRACE_FIELDS = [
     "virtual_time",
     "client_id",
@@ -547,6 +564,8 @@ class TraceWriter:
         self.state_group_creation_rows: List[Dict[str, Any]] = []
         self.calibrated_predictor_shadow_rows: List[Dict[str, Any]] = []
         self.predictor_native_group_shadow_rows: List[Dict[str, Any]] = []
+        self.lyapunov_decision_rows: List[Dict[str, Any]] = []
+        self.lyapunov_queue_rows: List[Dict[str, Any]] = []
         self.state_q_rows: List[Dict[str, Any]] = []
         self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
         self.group_recommendation_shadow_rows: List[Dict[str, Any]] = []
@@ -676,6 +695,12 @@ class TraceWriter:
 
     def record_predictor_native_group_shadow(self, row: Dict[str, Any]) -> None:
         self.predictor_native_group_shadow_rows.append(row)
+
+    def record_lyapunov_decision(self, row: Dict[str, Any]) -> None:
+        self.lyapunov_decision_rows.append(row)
+
+    def record_lyapunov_queue(self, row: Dict[str, Any]) -> None:
+        self.lyapunov_queue_rows.append(row)
 
     def set_rup_terminal_state(self, row: Dict[str, Any]) -> None:
         self.rup_terminal_state = dict(row)
@@ -975,6 +1000,18 @@ class TraceWriter:
                 self.output_dir / "predictor_native_group_shadow_trace.csv",
                 self.predictor_native_group_shadow_rows,
                 PREDICTOR_NATIVE_GROUP_SHADOW_TRACE_FIELDS,
+            )
+        if self.lyapunov_decision_rows:
+            _write_csv(
+                self.output_dir / "lyapunov_decision_trace.csv",
+                self.lyapunov_decision_rows,
+                LYAPUNOV_DECISION_TRACE_FIELDS,
+            )
+        if self.lyapunov_queue_rows:
+            _write_csv(
+                self.output_dir / "lyapunov_queue_trace.csv",
+                self.lyapunov_queue_rows,
+                LYAPUNOV_QUEUE_TRACE_FIELDS,
             )
         if self.state_q_rows:
             _write_csv(
