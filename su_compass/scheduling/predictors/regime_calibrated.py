@@ -65,6 +65,11 @@ class RegimePrediction:
     expert_weight: float
     used_candidate: bool
     num_observations: int
+    calibration_source: str = "analytical"
+    calibration_n: int = 0
+    calibration_rank: int = 0
+    client_margin: float = 0.0
+    pooled_margin: float = 0.0
 
 
 @dataclass
@@ -108,7 +113,8 @@ class RegimeCalibratedPredictor:
     def __init__(
         self, *, min_observations: int = 5, target_coverage: float = 0.90,
         history_size: int = 40, expert_rate: float = 0.15,
-        improvement_margin: float = 0.0,
+        improvement_margin: float = 0.0, finite_sample_pooling: bool = False,
+        client_calibration_min: int = 8,
     ) -> None:
         if min_observations < 1:
             raise ValueError("min_observations must be positive")
@@ -119,7 +125,46 @@ class RegimeCalibratedPredictor:
         self.history_size = history_size
         self.expert_rate = expert_rate
         self.improvement_margin = improvement_margin
+        self.finite_sample_pooling = finite_sample_pooling
+        self.client_calibration_min = client_calibration_min
         self._clients: Dict[str, _ClientModel] = {}
+        self._pooled_positive_errors: List[float] = []
+
+    def _finite_sample_margin(self, values: List[float]) -> tuple[float, int]:
+        """One-sided finite-sample conformal order statistic."""
+        if not values:
+            return 0.0, 0
+        ordered = sorted(values)
+        rank = min(len(ordered), math.ceil((len(ordered) + 1) * self.target_coverage))
+        return ordered[rank - 1], rank
+
+    def preview_safety_margin(
+        self, *, client_id: str, analytical_margin: float,
+    ) -> tuple[float, str, int, int, float, float]:
+        """Read-only v2 safety head for counterfactual Q curves."""
+        model = self._client(client_id)
+        client_margin, client_rank = self._finite_sample_margin(
+            model.candidate_positive_errors
+        )
+        pooled_margin, pooled_rank = self._finite_sample_margin(
+            self._pooled_positive_errors
+        )
+        if len(model.candidate_positive_errors) >= self.client_calibration_min:
+            source, values, rank, learned = (
+                "client_finite", model.candidate_positive_errors,
+                client_rank, client_margin,
+            )
+        elif len(self._pooled_positive_errors) >= self.client_calibration_min:
+            source, values, rank, learned = (
+                "pooled_finite", self._pooled_positive_errors,
+                pooled_rank, pooled_margin,
+            )
+        else:
+            source, values, rank, learned = "analytical", [], 0, 0.0
+        return (
+            max(float(analytical_margin), learned), source, len(values), rank,
+            client_margin, pooled_margin,
+        )
 
     def _client(self, client_id: str) -> _ClientModel:
         if client_id not in self._clients:
@@ -149,12 +194,32 @@ class RegimeCalibratedPredictor:
         raw_duration = baseline_duration
 
         analytical_margin = max(0.0, baseline_safe_duration - baseline_duration)
-        conformal_margin = _quantile(
-            model.candidate_positive_errors, self.target_coverage
-        )
+        calibration_source = "client_empirical"
+        calibration_values = model.candidate_positive_errors
+        if self.finite_sample_pooling:
+            if len(model.candidate_positive_errors) >= self.client_calibration_min:
+                calibration_source = "client_finite"
+            elif len(self._pooled_positive_errors) >= self.client_calibration_min:
+                calibration_source = "pooled_finite"
+                calibration_values = self._pooled_positive_errors
+            else:
+                calibration_source = "analytical"
+                calibration_values = []
+            conformal_margin, calibration_rank = self._finite_sample_margin(
+                calibration_values
+            )
+        else:
+            conformal_margin = _quantile(
+                calibration_values, self.target_coverage
+            )
+            calibration_rank = math.ceil(
+                self.target_coverage * len(calibration_values)
+            ) if calibration_values else 0
         raw_safe = raw_duration + max(analytical_margin, conformal_margin)
 
         enough = model.observations >= self.min_observations
+        if self.finite_sample_pooling:
+            enough = calibration_source != "analytical"
         # Applying the candidate changes only the safety head; point alignment
         # is bit-for-bit protected.  The max() above also prevents a calibrated
         # margin from becoming less conservative than the analytical baseline.
@@ -180,6 +245,15 @@ class RegimeCalibratedPredictor:
             expert_weight=expert_weight,
             used_candidate=use_candidate,
             num_observations=model.observations,
+            calibration_source=calibration_source,
+            calibration_n=len(calibration_values),
+            calibration_rank=calibration_rank,
+            client_margin=self._finite_sample_margin(
+                model.candidate_positive_errors
+            )[0] if self.finite_sample_pooling else conformal_margin,
+            pooled_margin=self._finite_sample_margin(
+                self._pooled_positive_errors
+            )[0] if self.finite_sample_pooling else 0.0,
         )
         model.pending = result
         return result
@@ -241,6 +315,10 @@ class RegimeCalibratedPredictor:
                 max(0.0, actual_duration - pending.raw_duration)
             )
             del model.candidate_positive_errors[:-self.history_size]
+            self._pooled_positive_errors.append(
+                max(0.0, actual_duration - pending.raw_duration)
+            )
+            del self._pooled_positive_errors[:-(self.history_size * 8)]
             regime_errors = (
                 model.burst_positive_errors if regime
                 else model.stable_positive_errors

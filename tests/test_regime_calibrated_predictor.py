@@ -51,6 +51,28 @@ class RegimeCalibratedPredictorTest(unittest.TestCase):
         )
         self.assertGreaterEqual(result.raw_safe_duration - result.raw_duration, 5.0)
 
+    def test_finite_sample_calibration_pools_short_client_history(self):
+        predictor = RegimeCalibratedPredictor(
+            target_coverage=0.85, finite_sample_pooling=True,
+            client_calibration_min=2,
+        )
+        for client, error in (("a", 1.0), ("b", 4.0)):
+            predictor.predict(
+                client_id=client, local_steps=10,
+                baseline_duration=10.0, baseline_safe_duration=10.0,
+            )
+            predictor.observe(
+                client_id=client, local_steps=10, actual_duration=10.0 + error,
+                compute_duration=10.0, communication_duration=error,
+            )
+        margin, source, n, rank, _, pooled = predictor.preview_safety_margin(
+            client_id="c", analytical_margin=0.5,
+        )
+        self.assertEqual(source, "pooled_finite")
+        self.assertEqual((n, rank), (2, 2))
+        self.assertEqual(margin, pooled)
+        self.assertEqual(margin, 4.0)
+
 
 if __name__ == "__main__":
     unittest.main()

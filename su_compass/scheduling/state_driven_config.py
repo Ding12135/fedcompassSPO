@@ -20,6 +20,7 @@ class StateDrivenConfig:
     calibrated_predictor_shadow: bool = True
     predictor_native_new_group_shadow: bool = True
     calibrated_shadow_target_coverage: float = 0.85
+    finite_sample_safety_calibration: bool = False
     lyapunov_mode: str = "off"
     lyapunov_rhythm_target: float = 16.4
     lyapunov_v: float = 1.0
@@ -29,6 +30,23 @@ class StateDrivenConfig:
     lyapunov_enable_rhythm_queue: bool = True
     lyapunov_enable_workload_queue: bool = True
     lyapunov_client_target_rates: str = ""
+    lyapunov_action_scope: str = "joint_v1"
+    lyapunov_holding_weight: float = 0.0
+    lyapunov_max_holding_ratio: float = 1_000_000.0
+    lyapunov_q_reference_spec: str = ""
+    lyapunov_region_extension_ratio: float = 0.10
+    lyapunov_create_hysteresis: float = 0.10
+    lyapunov_recruit_safe_cap_ratio: float = 1_000_000.0
+    lyapunov_create_safe_cost: bool = False
+    lyapunov_join_cadence_weight: float = 0.0
+    reason_aware_routing_shadow: bool = False
+    reason_aware_min_anchor_age_periods: float = 4.0
+    reason_aware_background_sojourn_periods: float = 2.0
+    reason_aware_cadence_median_ratio: float = 1.25
+    reason_aware_cadence_max_ratio: float = 2.0
+    reason_aware_one_report_structural_shadow: bool = False
+    reason_aware_one_report_communication_gate: float = 0.95
+    reason_aware_one_report_safety_fraction: float = 0.10
 
     def __post_init__(self) -> None:
         legal = {
@@ -63,3 +81,31 @@ class StateDrivenConfig:
             or self.lyapunov_create_penalty < 0
         ):
             raise ValueError("invalid Lyapunov constraint parameter")
+        if self.lyapunov_action_scope not in {
+            "joint_v1", "join_only_v2", "effective_service_v1", "effective_service_v2",
+            "effective_service_v2_1",
+        }:
+            raise ValueError("invalid Lyapunov action scope")
+        if self.lyapunov_action_scope in {
+            "effective_service_v1", "effective_service_v2",
+        } and self.lyapunov_mode == "apply":
+            raise ValueError("stateless effective_service modes are Shadow-only")
+        if self.lyapunov_holding_weight < 0 or self.lyapunov_max_holding_ratio < 0:
+            raise ValueError("invalid Lyapunov holding configuration")
+        if self.lyapunov_region_extension_ratio < 0 or self.lyapunov_create_hysteresis < 0:
+            raise ValueError("invalid regional decision configuration")
+        if self.lyapunov_recruit_safe_cap_ratio < 1.0:
+            raise ValueError("recruit safe cap ratio must be at least one")
+        if self.lyapunov_join_cadence_weight < 0:
+            raise ValueError("join cadence weight must be non-negative")
+        if (
+            self.reason_aware_min_anchor_age_periods < 0
+            or self.reason_aware_background_sojourn_periods < 0
+            or self.reason_aware_cadence_median_ratio <= 0
+            or self.reason_aware_cadence_max_ratio <= 0
+        ):
+            raise ValueError("invalid reason-aware routing configuration")
+        if not 0 <= self.reason_aware_one_report_communication_gate <= 1:
+            raise ValueError("one-report communication gate must be in [0, 1]")
+        if self.reason_aware_one_report_safety_fraction < 0:
+            raise ValueError("one-report safety fraction must be non-negative")

@@ -230,6 +230,8 @@ CALIBRATED_PREDICTOR_SHADOW_TRACE_FIELDS = [
     "baseline_abs_error", "shadow_abs_error", "baseline_safe_hit",
     "shadow_safe_hit", "baseline_pinball", "shadow_pinball",
     "point_prediction_better", "safe_prediction_better",
+    "calibration_source", "calibration_n", "calibration_rank",
+    "analytical_margin", "client_margin", "pooled_margin", "selected_margin",
 ]
 
 PREDICTOR_NATIVE_GROUP_SHADOW_TRACE_FIELDS = [
@@ -252,7 +254,9 @@ LYAPUNOV_DECISION_TRACE_FIELDS = [
     "rejected_holding_actions", "rejected_q_actions",
     "recommended_mode", "recommended_group_id", "recommended_q",
     "recommended_score", "recommended_sojourn", "recommended_holding_wait",
-    "recommended_external_wait", "applied_mode", "applied_group_id",
+    "recommended_external_wait", "recommended_group_frontier",
+    "recommended_affected_pending", "recommended_cadence_excess",
+    "join_cadence_weight", "applied_mode", "applied_group_id",
     "applied_q", "recommendation_applied",
 ]
 
@@ -261,6 +265,61 @@ LYAPUNOV_QUEUE_TRACE_FIELDS = [
     "rhythm_debt_before", "rhythm_debt_after", "workload_debt_before",
     "target_workload_arrival", "effective_work_service",
     "workload_debt_after", "participated",
+]
+
+EFFECTIVE_SERVICE_Q_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "group_id",
+    "reference_q", "raw_align_q", "controlled_align_q", "trust_upper_q",
+    "candidate_qs", "predictor_reliable", "reason", "expected_frontier",
+    "safe_frontier", "deadline", "group_already_at_risk",
+    "safety_calibration_source", "safety_calibration_n",
+    "safety_calibration_rank", "selected_safety_margin",
+]
+
+EFFECTIVE_SERVICE_REGION_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "region", "reason",
+    "num_legal_join", "num_legal_create", "best_join_score",
+    "best_create_score", "score_gap", "hysteresis", "recommended_mode",
+    "recommended_group_id", "recommended_q", "recruitment_expected",
+    "recruitment_expected_raw", "recruitment_safe",
+    "recruitment_safe_raw", "recruitment_safe_cap",
+    "create_safe_cost_enabled", "recruitment_source", "predicted_group_size",
+    "counterfactual_outcome_observable",
+    "calibration_source", "calibration_n", "calibration_rank",
+]
+
+EFFECTIVE_SERVICE_SHADOW_OUTCOME_TRACE_FIELDS = [
+    "shadow_group_id", "created_decision_id", "created_time", "settled_time",
+    "deadline", "projected_group_size", "projected_singleton",
+    "projected_safe_hit", "projected_work", "member_clients",
+    "member_decisions", "status",
+]
+
+REASON_AWARE_ROUTING_TRACE_FIELDS = [
+    "decision_id", "virtual_time", "client_id", "slow_cause",
+    "classification_confidence", "predictor_mature", "compute_ratio",
+    "communication_ratio", "availability_ratio", "spike_ratio",
+    "service_age", "service_age_periods", "recent_cadence_median",
+    "recent_cadence_max", "rhythm_debt", "active_groups", "at_risk_groups",
+    "system_healthy", "recommended_lane", "route_reason",
+    "compatible_background_group", "anchor_eligible", "v23_mode",
+    "v23_group_id", "v23_q", "shadow_mode", "shadow_group_id", "shadow_q",
+    "q_unchanged", "recommendation_changed", "shadow_predicted_sojourn",
+    "shadow_holding_wait", "shadow_external_wait", "shadow_cadence_excess",
+    "shadow_deadline_safe", "shadow_safety_slack",
+    "one_report_structural_enabled", "one_report_structural_eligible",
+    "one_report_structural_reason", "one_report_structural_q",
+    "one_report_structural_predicted_duration",
+    "one_report_structural_safe_duration",
+    "one_report_structural_predicted_finish",
+    "one_report_structural_safe_finish",
+    "one_report_structural_fixed_duration",
+    "one_report_structural_compute_duration",
+    "one_report_structural_communication_ratio",
+    "one_report_structural_q_unchanged",
+    "structural_group_window_active", "structural_group_expected_time",
+    "structural_group_latest_time", "structural_group_sojourn",
+    "structural_group_cadence_excess", "elastic_join_avoidance",
 ]
 
 STATE_Q_TRACE_FIELDS = [
@@ -566,6 +625,10 @@ class TraceWriter:
         self.predictor_native_group_shadow_rows: List[Dict[str, Any]] = []
         self.lyapunov_decision_rows: List[Dict[str, Any]] = []
         self.lyapunov_queue_rows: List[Dict[str, Any]] = []
+        self.effective_service_q_rows: List[Dict[str, Any]] = []
+        self.effective_service_region_rows: List[Dict[str, Any]] = []
+        self.effective_service_shadow_outcome_rows: List[Dict[str, Any]] = []
+        self.reason_aware_routing_rows: List[Dict[str, Any]] = []
         self.state_q_rows: List[Dict[str, Any]] = []
         self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
         self.group_recommendation_shadow_rows: List[Dict[str, Any]] = []
@@ -701,6 +764,18 @@ class TraceWriter:
 
     def record_lyapunov_queue(self, row: Dict[str, Any]) -> None:
         self.lyapunov_queue_rows.append(row)
+
+    def record_effective_service_q(self, row: Dict[str, Any]) -> None:
+        self.effective_service_q_rows.append(row)
+
+    def record_effective_service_region(self, row: Dict[str, Any]) -> None:
+        self.effective_service_region_rows.append(row)
+
+    def record_effective_service_shadow_outcome(self, row: Dict[str, Any]) -> None:
+        self.effective_service_shadow_outcome_rows.append(row)
+
+    def record_reason_aware_routing(self, row: Dict[str, Any]) -> None:
+        self.reason_aware_routing_rows.append(row)
 
     def set_rup_terminal_state(self, row: Dict[str, Any]) -> None:
         self.rup_terminal_state = dict(row)
@@ -1012,6 +1087,30 @@ class TraceWriter:
                 self.output_dir / "lyapunov_queue_trace.csv",
                 self.lyapunov_queue_rows,
                 LYAPUNOV_QUEUE_TRACE_FIELDS,
+            )
+        if self.effective_service_q_rows:
+            _write_csv(
+                self.output_dir / "effective_service_q_shadow_trace.csv",
+                self.effective_service_q_rows,
+                EFFECTIVE_SERVICE_Q_TRACE_FIELDS,
+            )
+        if self.effective_service_region_rows:
+            _write_csv(
+                self.output_dir / "effective_service_region_shadow_trace.csv",
+                self.effective_service_region_rows,
+                EFFECTIVE_SERVICE_REGION_TRACE_FIELDS,
+            )
+        if self.effective_service_shadow_outcome_rows:
+            _write_csv(
+                self.output_dir / "effective_service_shadow_outcome_trace.csv",
+                self.effective_service_shadow_outcome_rows,
+                EFFECTIVE_SERVICE_SHADOW_OUTCOME_TRACE_FIELDS,
+            )
+        if self.reason_aware_routing_rows:
+            _write_csv(
+                self.output_dir / "reason_aware_routing_shadow_trace.csv",
+                self.reason_aware_routing_rows,
+                REASON_AWARE_ROUTING_TRACE_FIELDS,
             )
         if self.state_q_rows:
             _write_csv(

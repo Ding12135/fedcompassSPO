@@ -31,6 +31,14 @@ BASELINE_TARGET_RATES_08 = (
     "client_6=0.000346,client_7=0.002284"
 )
 
+# Frozen seed-2026 FedCompass per-client median Q.  This is a replay/Shadow
+# calibration input, not a value learned from the candidate trajectory.  It
+# must be replaced by a multi-seed frozen statistic before Apply.
+BASELINE_MEDIAN_Q_SEED2026 = (
+    "client_0=174,client_1=188,client_2=84,client_3=156,"
+    "client_4=111,client_5=47,client_6=47,client_7=64"
+)
+
 LYAPUNOV_PRESETS = {
     "state_driven_lyapunov_shadow": ["--sd_lyapunov_mode", "shadow"],
     "state_driven_lyapunov_v1": ["--sd_lyapunov_mode", "apply"],
@@ -45,6 +53,113 @@ LYAPUNOV_PRESETS = {
     ],
     "state_driven_lyapunov_no_qcap": [
         "--sd_lyapunov_mode", "apply", "--sd_lyapunov_q_trust_eta", "1000000",
+    ],
+    "state_driven_lyapunov_join_v2_shadow": [
+        "--sd_lyapunov_mode", "shadow",
+        "--sd_lyapunov_action_scope", "join_only_v2",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "100.0",
+        "--sd_lyapunov_max_holding_ratio", "4.0",
+    ],
+    "state_driven_lyapunov_join_v2": [
+        "--sd_lyapunov_mode", "apply",
+        "--sd_lyapunov_action_scope", "join_only_v2",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "100.0",
+        "--sd_lyapunov_max_holding_ratio", "4.0",
+    ],
+    "state_driven_effective_service_v1_shadow": [
+        "--sd_lyapunov_mode", "shadow",
+        "--sd_lyapunov_action_scope", "effective_service_v1",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+    ],
+    "state_driven_effective_service_v2_shadow": [
+        "--sd_lyapunov_mode", "shadow",
+        "--sd_lyapunov_action_scope", "effective_service_v2",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+        "--sd_finite_sample_safety_calibration", "on",
+        "--sd_lyapunov_region_extension_ratio", "0.10",
+        "--sd_lyapunov_create_hysteresis", "0.10",
+    ],
+    "state_driven_effective_service_v2_1_shadow": [
+        "--sd_lyapunov_mode", "shadow",
+        "--sd_lyapunov_action_scope", "effective_service_v2_1",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+        "--sd_finite_sample_safety_calibration", "on",
+        "--sd_lyapunov_region_extension_ratio", "0.10",
+        "--sd_lyapunov_create_hysteresis", "0.10",
+    ],
+    "state_driven_effective_service_v2_1_apply_smoke": [
+        "--sd_lyapunov_mode", "apply",
+        "--sd_lyapunov_action_scope", "effective_service_v2_1",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+        "--sd_finite_sample_safety_calibration", "on",
+        "--sd_lyapunov_region_extension_ratio", "0.10",
+        "--sd_lyapunov_create_hysteresis", "0.10",
+    ],
+    "state_driven_effective_service_v2_2_apply_smoke": [
+        "--sd_lyapunov_mode", "apply",
+        "--sd_lyapunov_action_scope", "effective_service_v2_1",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+        "--sd_finite_sample_safety_calibration", "on",
+        "--sd_lyapunov_region_extension_ratio", "0.10",
+        "--sd_lyapunov_create_hysteresis", "0.10",
+        "--sd_lyapunov_recruit_safe_cap_ratio", "2.0",
+        "--sd_lyapunov_create_safe_cost", "on",
+    ],
+    "state_driven_effective_service_v2_3_apply_smoke": [
+        "--sd_lyapunov_mode", "apply",
+        "--sd_lyapunov_action_scope", "effective_service_v2_1",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+        "--sd_finite_sample_safety_calibration", "on",
+        "--sd_lyapunov_region_extension_ratio", "0.10",
+        "--sd_lyapunov_create_hysteresis", "0.10",
+        "--sd_lyapunov_recruit_safe_cap_ratio", "2.0",
+        "--sd_lyapunov_create_safe_cost", "on",
+        "--sd_lyapunov_join_cadence_weight", "1.0",
+    ],
+    "state_driven_effective_service_v2_4_routing_shadow": [
+        "--sd_lyapunov_mode", "apply",
+        "--sd_lyapunov_action_scope", "effective_service_v2_1",
+        "--sd_lyapunov_workload_queue", "off",
+        "--sd_lyapunov_holding_weight", "0.25",
+        "--sd_lyapunov_max_holding_wait", "85.0",
+        "--sd_lyapunov_max_holding_ratio", "6.5",
+        "--sd_lyapunov_q_reference_spec", BASELINE_MEDIAN_Q_SEED2026,
+        "--sd_finite_sample_safety_calibration", "on",
+        "--sd_lyapunov_region_extension_ratio", "0.10",
+        "--sd_lyapunov_create_hysteresis", "0.10",
+        "--sd_lyapunov_recruit_safe_cap_ratio", "2.0",
+        "--sd_lyapunov_create_safe_cost", "on",
+        "--sd_lyapunov_join_cadence_weight", "1.0",
+        "--sd_reason_aware_routing_shadow", "on",
+        "--sd_reason_aware_one_report_structural_shadow", "on",
     ],
 }
 for _preset in LYAPUNOV_PRESETS:

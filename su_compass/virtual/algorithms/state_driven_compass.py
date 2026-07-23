@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import math
 from typing import Any, Dict, List
 
@@ -13,7 +14,22 @@ from su_compass.scheduling.fedcompass_reference import (
 from su_compass.scheduling.policies.joint_group_q import JointGroupQPolicy
 from su_compass.scheduling.policies.lyapunov_group_q import (
     LyapunovAction,
+    LyapunovDecision,
     LyapunovGroupQPolicy,
+    choose_effective_service_v2,
+)
+from su_compass.scheduling.policies.controlled_q_candidates import (
+    controlled_create_qs,
+    controlled_join_qs,
+)
+from su_compass.scheduling.policies.reason_aware_routing import (
+    ReasonAwareRoute,
+    SlowCause,
+    classify_slow_cause,
+    recommend_reason_aware_route,
+)
+from su_compass.scheduling.policies.one_report_structural import (
+    predict_one_report_structural,
 )
 from su_compass.scheduling.predictors.regime_calibrated import RegimeCalibratedPredictor
 from su_compass.scheduling.state_time_model import StateTimeModel, state_group_window
@@ -38,6 +54,7 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         self._state_group_creation_trace_buffer: List[dict] = []
         self._calibrated_shadow = RegimeCalibratedPredictor(
             target_coverage=state_driven_config.calibrated_shadow_target_coverage,
+            finite_sample_pooling=state_driven_config.finite_sample_safety_calibration,
         )
         self._calibrated_shadow_trace_buffer: List[dict] = []
         self._native_group_shadow_trace_buffer: List[dict] = []
@@ -51,15 +68,32 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             create_penalty=state_driven_config.lyapunov_create_penalty,
             enable_rhythm_queue=state_driven_config.lyapunov_enable_rhythm_queue,
             enable_workload_queue=state_driven_config.lyapunov_enable_workload_queue,
+            action_scope=state_driven_config.lyapunov_action_scope,
+            holding_weight=state_driven_config.lyapunov_holding_weight,
+            max_holding_ratio=state_driven_config.lyapunov_max_holding_ratio,
+            join_cadence_weight=state_driven_config.lyapunov_join_cadence_weight,
         )
         self._lyapunov_rhythm_debt = 0.0
         self._lyapunov_workload_debt: Dict[str, float] = {}
         self._lyapunov_target_rates = self._parse_target_rates(
             state_driven_config.lyapunov_client_target_rates
         )
+        self._lyapunov_q_references = self._parse_q_references(
+            state_driven_config.lyapunov_q_reference_spec
+        )
         self._lyapunov_last_aggregation_time = 0.0
         self._lyapunov_decision_trace_buffer: List[dict] = []
         self._lyapunov_queue_trace_buffer: List[dict] = []
+        self._effective_service_q_trace_buffer: List[dict] = []
+        self._effective_service_region_trace_buffer: List[dict] = []
+        self._lyapunov_recent_intervals: List[float] = []
+        self._lyapunov_recent_group_sizes: List[int] = []
+        self._effective_service_shadow_groups: Dict[int, dict] | None = None
+        self._effective_service_shadow_next_group_id = -1
+        self._effective_service_shadow_outcome_trace_buffer: List[dict] = []
+        self._reason_aware_routing_trace_buffer: List[dict] = []
+        self._reason_aware_last_service_time: Dict[str, float] = {}
+        self._reason_aware_structural_group_windows: Dict[int, tuple[float, float]] = {}
 
     @staticmethod
     def _parse_target_rates(spec: str) -> Dict[str, float]:
@@ -73,6 +107,19 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
                 raise ValueError("Lyapunov client target rates must be non-negative")
             rates[client_id.strip()] = rate
         return rates
+
+    @staticmethod
+    def _parse_q_references(spec: str) -> Dict[str, int]:
+        references: Dict[str, int] = {}
+        if not spec.strip():
+            return references
+        for item in spec.split(","):
+            client_id, value = item.split("=", 1)
+            q = int(value)
+            if q <= 0:
+                raise ValueError("Lyapunov Q references must be positive")
+            references[client_id.strip()] = q
+        return references
 
     @property
     def algorithm_name(self) -> str:
@@ -193,6 +240,13 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
                 "shadow_conformal_margin": shadow.conformal_margin,
                 "shadow_used_candidate": int(shadow.used_candidate),
                 "shadow_burst_probability": shadow.burst_probability,
+                "calibration_source": shadow.calibration_source,
+                "calibration_n": shadow.calibration_n,
+                "calibration_rank": shadow.calibration_rank,
+                "analytical_margin": shadow.analytical_margin,
+                "client_margin": shadow.client_margin,
+                "pooled_margin": shadow.pooled_margin,
+                "selected_margin": shadow.safe_duration - shadow.predicted_duration,
             }
         return super()._append_dispatch(
             client_id, virtual_now, local_steps_assigned,
@@ -365,6 +419,10 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
 
         group = self.arrival_group[decision.group_id]
         group["clients"].append(client_id)
+        group.setdefault("predicted_finish_times", {})[client_id] = (
+            decision.predicted_finish_time
+        )
+        group.setdefault("safe_finish_times", {})[client_id] = decision.safe_finish_time
         self.client_info[client_id]["goa"] = decision.group_id
         self.client_info[client_id]["local_steps"] = decision.q
         self.client_info[client_id]["start_time"] = self._virtual_now
@@ -403,6 +461,340 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             return []
         return self._create_group(client_id)
 
+    def _dynamic_group_frontier(self, group: dict) -> float:
+        """Best current finish frontier for clients still pending in a group."""
+        pending = list(group.get("clients", []))
+        predicted = group.get("predicted_finish_times", {})
+        known = [float(predicted[cid]) for cid in pending if cid in predicted]
+        if len(known) < len(pending):
+            # Old/FedCompass-created groups lack per-member predictions.  Their
+            # immutable anchor expectation is the conservative compatible fallback.
+            known.append(float(group["expected_arrival_time"]))
+        if not known:
+            return max(self._virtual_now, float(group["expected_arrival_time"]))
+        return min(float(group["latest_arrival_time"]), max(known))
+
+    def _dynamic_group_safe_frontier(self, group: dict) -> float:
+        pending = list(group.get("clients", []))
+        predicted = group.get("safe_finish_times", {})
+        known = [float(predicted[cid]) for cid in pending if cid in predicted]
+        if len(known) < len(pending):
+            known.append(float(group["latest_arrival_time"]))
+        if not known:
+            return self._virtual_now
+        return max(known)
+
+    def _effective_service_v1_join_actions(self, client_id: str, curve, *, groups=None):
+        """Build controlled join candidates for effective-service shadows."""
+        calibration_source = "analytical_baseline"
+        calibration_n = calibration_rank = 0
+        selected_margin = ""
+        if (
+            self.state_driven_config.lyapunov_action_scope in {
+                "effective_service_v2", "effective_service_v2_1",
+            }
+            and self.state_driven_config.finite_sample_safety_calibration
+        ):
+            adjusted = []
+            for point in curve:
+                margin, source, n, rank, _, _ = self._calibrated_shadow.preview_safety_margin(
+                    client_id=client_id,
+                    analytical_margin=point.safe_duration - point.predicted_duration,
+                )
+                adjusted.append(type(point)(**{
+                    **point.__dict__,
+                    "safe_duration": point.predicted_duration + margin,
+                    "safe_finish_time": point.predicted_finish_time + margin,
+                    "uncertainty": margin,
+                }))
+                calibration_source = source
+                calibration_n, calibration_rank = n, rank
+                selected_margin = margin
+            curve = adjusted
+        reference_q = self._lyapunov_q_references.get(client_id)
+        if reference_q is None:
+            return []
+        by_q = {point.q: point for point in curve}
+        actions = []
+        active_groups = self.arrival_group if groups is None else groups
+        for group_id, group in active_groups.items():
+            frontier = self._dynamic_group_frontier(group)
+            safe_frontier = self._dynamic_group_safe_frontier(group)
+            qset = controlled_join_qs(
+                curve=curve, target_time=frontier,
+                deadline=float(group["latest_arrival_time"]),
+                group_safe_frontier=safe_frontier, reference_q=reference_q,
+                qmin=self.min_local_steps, qmax=self.max_local_steps,
+                trust_eta=self.state_driven_config.lyapunov_q_trust_eta,
+            )
+            self._effective_service_q_trace_buffer.append({
+                "decision_id": self._decision_id(client_id),
+                "virtual_time": self._virtual_now, "client_id": client_id,
+                "group_id": int(group_id), "reference_q": qset.reference_q,
+                "raw_align_q": qset.raw_align_q,
+                "controlled_align_q": qset.controlled_align_q,
+                "trust_upper_q": qset.trust_upper_q,
+                "candidate_qs": "|".join(map(str, qset.candidate_qs)),
+                "predictor_reliable": int(qset.reliable), "reason": qset.reason,
+                "expected_frontier": frontier, "safe_frontier": safe_frontier,
+                "deadline": float(group["latest_arrival_time"]),
+                "group_already_at_risk": int(
+                    safe_frontier > float(group["latest_arrival_time"])
+                ),
+                "safety_calibration_source": calibration_source,
+                "safety_calibration_n": calibration_n,
+                "safety_calibration_rank": calibration_rank,
+                "selected_safety_margin": selected_margin,
+            })
+            for q in qset.candidate_qs:
+                point = by_q[q]
+                new_frontier = max(frontier, point.predicted_finish_time)
+                actions.append(LyapunovAction(
+                    mode="join", group_id=int(group_id), q=q,
+                    predicted_finish_time=point.predicted_finish_time,
+                    predicted_duration=point.predicted_duration,
+                    safe_finish_time=point.safe_finish_time,
+                    group_frontier_time=frontier,
+                    latest_arrival_time=float(group["latest_arrival_time"]),
+                    deadline_safe=(
+                        max(safe_frontier, point.safe_finish_time)
+                        <= float(group["latest_arrival_time"])
+                    ),
+                    holding_wait=max(0.0, new_frontier - point.predicted_finish_time),
+                    external_wait=max(0.0, new_frontier - frontier),
+                    affected_pending_clients=len(group.get("clients", [])),
+                    predicted_sojourn=new_frontier - self._virtual_now,
+                    effective_work=q / self.max_local_steps,
+                    utility=math.log1p(q / max(self.min_local_steps, 1)),
+                ))
+        return actions
+
+    def _effective_service_v2_create_actions(self, client_id: str, curve):
+        reference_q = self._lyapunov_q_references.get(client_id)
+        if reference_q is None:
+            return []
+        adjusted = []
+        for point in curve:
+            margin, *_ = self._calibrated_shadow.preview_safety_margin(
+                client_id=client_id,
+                analytical_margin=point.safe_duration - point.predicted_duration,
+            )
+            adjusted.append(type(point)(**{
+                **point.__dict__,
+                "safe_duration": point.predicted_duration + margin,
+                "safe_finish_time": point.predicted_finish_time + margin,
+                "uncertainty": margin,
+            }))
+        curve = adjusted
+        by_q = {point.q: point for point in curve}
+        qs = controlled_create_qs(
+            curve=curve, reference_q=reference_q,
+            qmin=self.min_local_steps, qmax=self.max_local_steps,
+            trust_eta=self.state_driven_config.lyapunov_q_trust_eta,
+        )
+        recent = sorted(self._lyapunov_recent_intervals[-12:])
+        if recent:
+            recruit_expected_raw = recent[len(recent) // 2]
+            rank = min(len(recent) - 1, math.ceil(0.85 * (len(recent) + 1)) - 1)
+            recruit_safe_raw = recent[rank]
+            source = "recent_aggregation_intervals"
+        else:
+            recruit_expected_raw = self.state_driven_config.lyapunov_rhythm_target
+            recruit_safe_raw = 1.2 * recruit_expected_raw
+            source = "frozen_rhythm_fallback"
+        recruit_safe_cap = (
+            self.state_driven_config.lyapunov_recruit_safe_cap_ratio
+            * self.state_driven_config.lyapunov_rhythm_target
+        )
+        recruit_expected = min(recruit_expected_raw, recruit_safe_cap)
+        recruit_safe = max(recruit_expected, min(recruit_safe_raw, recruit_safe_cap))
+        if (
+            recruit_expected < recruit_expected_raw
+            or recruit_safe < recruit_safe_raw
+        ):
+            source += "_rhythm_trust_clipped"
+        actions = []
+        for q in qs:
+            point = by_q[q]
+            actions.append(LyapunovAction(
+                mode="create", group_id=-1, q=q,
+                predicted_finish_time=point.predicted_finish_time,
+                predicted_duration=point.predicted_duration,
+                safe_finish_time=point.safe_finish_time + recruit_safe,
+                group_frontier_time=point.predicted_finish_time + recruit_expected,
+                latest_arrival_time=point.safe_finish_time + recruit_safe,
+                deadline_safe=True, holding_wait=recruit_expected,
+                external_wait=recruit_expected, affected_pending_clients=0,
+                predicted_sojourn=point.predicted_duration + (
+                    recruit_safe
+                    if self.state_driven_config.lyapunov_create_safe_cost
+                    else recruit_expected
+                ),
+                effective_work=q / self.max_local_steps,
+                utility=math.log1p(q / max(self.min_local_steps, 1)),
+            ))
+        recent_sizes = sorted(self._lyapunov_recent_group_sizes[-12:])
+        predicted_group_size = recent_sizes[len(recent_sizes) // 2] if recent_sizes else 1
+        return (
+            actions, recruit_expected, recruit_safe, source, predicted_group_size,
+            recruit_expected_raw, recruit_safe_raw, recruit_safe_cap,
+        )
+
+    def _choose_effective_service_v2(
+        self, client_id: str, scored, *, recruit_expected: float,
+        recruit_safe: float, recruitment_source: str, predicted_group_size: int,
+        recruit_expected_raw: float = 0.0,
+        recruit_safe_raw: float = 0.0, recruit_safe_cap: float = math.inf,
+    ) -> LyapunovDecision:
+        obvious_limit = (
+            self.state_driven_config.lyapunov_region_extension_ratio
+            * self.state_driven_config.lyapunov_rhythm_target
+        )
+        selection = choose_effective_service_v2(
+            scored, obvious_extension_limit=obvious_limit,
+            obvious_holding_limit=self.state_driven_config.lyapunov_rhythm_target,
+            create_hysteresis=self.state_driven_config.lyapunov_create_hysteresis,
+        )
+        best_join, best_create = selection.best_join, selection.best_create
+        calibration_source = ""
+        calibration_n = calibration_rank = 0
+        if self.state_driven_config.finite_sample_safety_calibration:
+            _, calibration_source, calibration_n, calibration_rank, _, _ = (
+                self._calibrated_shadow.preview_safety_margin(
+                    client_id=client_id, analytical_margin=0.0,
+                )
+            )
+        selected = selection.decision.action
+        region, reason = selection.region, selection.reason
+        self._effective_service_region_trace_buffer.append({
+            "decision_id": self._decision_id(client_id),
+            "virtual_time": self._virtual_now, "client_id": client_id,
+            "region": region, "reason": reason,
+            "num_legal_join": selection.joins, "num_legal_create": selection.creates,
+            "best_join_score": best_join.score if best_join else "",
+            "best_create_score": best_create.score if best_create else "",
+            "score_gap": (
+                best_join.score - best_create.score
+                if best_join is not None and best_create is not None else ""
+            ),
+            "hysteresis": self.state_driven_config.lyapunov_create_hysteresis,
+            "recommended_mode": selected.mode if selected else "",
+            "recommended_group_id": selected.group_id if selected else -1,
+            "recommended_q": selected.q if selected else -1,
+            "recruitment_expected": recruit_expected,
+            "recruitment_expected_raw": recruit_expected_raw,
+            "recruitment_safe": recruit_safe,
+            "recruitment_safe_raw": recruit_safe_raw,
+            "recruitment_safe_cap": recruit_safe_cap,
+            "create_safe_cost_enabled": int(
+                self.state_driven_config.lyapunov_create_safe_cost
+            ),
+            "recruitment_source": recruitment_source,
+            "predicted_group_size": predicted_group_size,
+            "counterfactual_outcome_observable": int(
+                self.state_driven_config.lyapunov_action_scope
+                == "effective_service_v2_1"
+            ),
+            "calibration_source": calibration_source,
+            "calibration_n": calibration_n,
+            "calibration_rank": calibration_rank,
+        })
+        return selection.decision
+
+    def _settle_effective_service_shadow_groups(self) -> None:
+        if self._effective_service_shadow_groups is None:
+            return
+        expired = [
+            group_id for group_id, group in self._effective_service_shadow_groups.items()
+            if float(group["latest_arrival_time"]) <= self._virtual_now
+        ]
+        for group_id in expired:
+            group = self._effective_service_shadow_groups.pop(group_id)
+            members = list(group.get("clients", []))
+            safe_finishes = list(group.get("safe_finish_times", {}).values())
+            self._effective_service_shadow_outcome_trace_buffer.append({
+                "shadow_group_id": group_id,
+                "created_decision_id": group.get("created_decision_id", "seed_real_group"),
+                "created_time": group.get("created_time", ""),
+                "settled_time": self._virtual_now,
+                "deadline": group["latest_arrival_time"],
+                "projected_group_size": len(members),
+                "projected_singleton": int(len(members) == 1),
+                "projected_safe_hit": int(
+                    bool(safe_finishes)
+                    and max(map(float, safe_finishes)) <= float(group["latest_arrival_time"])
+                ),
+                "projected_work": sum(group.get("member_q", {}).values()),
+                "member_clients": "|".join(members),
+                "member_decisions": "|".join(group.get("member_decisions", [])),
+                "status": "settled",
+            })
+
+    def _ensure_effective_service_shadow_groups(self) -> Dict[int, dict]:
+        if self._effective_service_shadow_groups is None:
+            # Seed only groups that can still accept/settle pending work.  A real
+            # group may remain visible during the dispatch callback that closes
+            # it; copying that expired/empty shell into the counterfactual state
+            # produces a fake unsafe singleton (or empty group) at first settle.
+            self._effective_service_shadow_groups = copy.deepcopy({
+                group_id: group
+                for group_id, group in self.arrival_group.items()
+                if group.get("clients")
+                and float(group.get("latest_arrival_time", -math.inf))
+                > self._virtual_now
+            })
+            for group_id, group in self._effective_service_shadow_groups.items():
+                group.setdefault("created_decision_id", "seed_real_group")
+                group.setdefault("member_decisions", [])
+                group.setdefault("member_q", {
+                    client_id: int(self.client_info.get(client_id, {}).get("local_steps", 0))
+                    for client_id in group.get("clients", [])
+                })
+            self._effective_service_shadow_next_group_id = -1
+        self._settle_effective_service_shadow_groups()
+        return self._effective_service_shadow_groups
+
+    def _apply_effective_service_shadow_action(
+        self, client_id: str, action: LyapunovAction,
+    ) -> None:
+        groups = self._ensure_effective_service_shadow_groups()
+        decision_id = self._decision_id(client_id)
+        if action.mode == "create":
+            group_id = self._effective_service_shadow_next_group_id
+            self._effective_service_shadow_next_group_id -= 1
+            groups[group_id] = {
+                "clients": [client_id], "arrived_clients": [],
+                "expected_arrival_time": action.group_frontier_time,
+                "latest_arrival_time": action.latest_arrival_time,
+                "created_time": self._virtual_now,
+                "created_decision_id": decision_id,
+                "predicted_finish_times": {client_id: action.predicted_finish_time},
+                "safe_finish_times": {client_id: action.safe_finish_time},
+                "member_q": {client_id: action.q},
+                "member_decisions": [decision_id],
+            }
+            action_group_id = group_id
+        else:
+            group = groups[action.group_id]
+            group.setdefault("clients", []).append(client_id)
+            group.setdefault("predicted_finish_times", {})[client_id] = action.predicted_finish_time
+            group.setdefault("safe_finish_times", {})[client_id] = action.safe_finish_time
+            group.setdefault("member_q", {})[client_id] = action.q
+            group.setdefault("member_decisions", []).append(decision_id)
+            action_group_id = action.group_id
+        self._effective_service_shadow_outcome_trace_buffer.append({
+            "shadow_group_id": action_group_id,
+            "created_decision_id": groups[action_group_id].get("created_decision_id", ""),
+            "created_time": groups[action_group_id].get("created_time", ""),
+            "settled_time": "", "deadline": groups[action_group_id]["latest_arrival_time"],
+            "projected_group_size": len(groups[action_group_id].get("clients", [])),
+            "projected_singleton": "", "projected_safe_hit": "",
+            "projected_work": sum(groups[action_group_id].get("member_q", {}).values()),
+            "member_clients": "|".join(groups[action_group_id].get("clients", [])),
+            "member_decisions": "|".join(groups[action_group_id].get("member_decisions", [])),
+            "status": "create" if action.mode == "create" else "join",
+        })
+
     def _lyapunov_actions(self, client_id: str):
         curve, monotonic = self._curve(client_id)
         speed = float(self.client_info[client_id]["speed"])
@@ -410,23 +802,103 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             now=self._virtual_now, speed=speed, groups=self.arrival_group,
             qmin=self.min_local_steps, qmax=self.max_local_steps,
         )
+        scope = self.state_driven_config.lyapunov_action_scope
+        if scope == "effective_service_v2_1":
+            analytical = curve[0].safe_duration - curve[0].predicted_duration
+            _, calibration_source, calibration_n, calibration_rank, _, _ = (
+                self._calibrated_shadow.preview_safety_margin(
+                    client_id=client_id, analytical_margin=analytical,
+                )
+            )
+            if calibration_source == "analytical":
+                self._effective_service_region_trace_buffer.append({
+                    "decision_id": self._decision_id(client_id),
+                    "virtual_time": self._virtual_now, "client_id": client_id,
+                    "region": "cold_start", "reason": "cold_start_defer_to_safe_reuse",
+                    "num_legal_join": 0, "num_legal_create": 0,
+                    "best_join_score": "", "best_create_score": "",
+                    "score_gap": "", "hysteresis": self.state_driven_config.lyapunov_create_hysteresis,
+                    "recommended_mode": "defer", "recommended_group_id": -1,
+                    "recommended_q": -1, "recruitment_expected": "",
+                    "recruitment_expected_raw": "", "recruitment_safe": "",
+                    "recruitment_safe_raw": "", "recruitment_safe_cap": "",
+                    "create_safe_cost_enabled": int(
+                        self.state_driven_config.lyapunov_create_safe_cost
+                    ),
+                    "recruitment_source": "",
+                    "predicted_group_size": "", "counterfactual_outcome_observable": 0,
+                    "calibration_source": calibration_source,
+                    "calibration_n": calibration_n, "calibration_rank": calibration_rank,
+                })
+                return (
+                    curve, monotonic, fed_join, self.max_local_steps, [],
+                    LyapunovDecision(False, reason="cold_start_defer_to_safe_reuse"),
+                )
+            shadow_mode = self.state_driven_config.lyapunov_mode == "shadow"
+            effective_groups = (
+                self._ensure_effective_service_shadow_groups()
+                if shadow_mode else self.arrival_group
+            )
+            if shadow_mode and any(
+                client_id in group.get("clients", [])
+                for group in effective_groups.values()
+            ):
+                self._effective_service_region_trace_buffer.append({
+                    "decision_id": self._decision_id(client_id),
+                    "virtual_time": self._virtual_now, "client_id": client_id,
+                    "region": "blocked", "reason": "shadow_dispatch_blocked",
+                    "num_legal_join": 0, "num_legal_create": 0,
+                    "best_join_score": "", "best_create_score": "",
+                    "score_gap": "", "hysteresis": self.state_driven_config.lyapunov_create_hysteresis,
+                    "recommended_mode": "defer", "recommended_group_id": -1,
+                    "recommended_q": -1, "recruitment_expected": "",
+                    "recruitment_expected_raw": "", "recruitment_safe": "",
+                    "recruitment_safe_raw": "", "recruitment_safe_cap": "",
+                    "create_safe_cost_enabled": int(
+                        self.state_driven_config.lyapunov_create_safe_cost
+                    ),
+                    "recruitment_source": "",
+                    "predicted_group_size": "", "counterfactual_outcome_observable": 0,
+                    "calibration_source": calibration_source,
+                    "calibration_n": calibration_n, "calibration_rank": calibration_rank,
+                })
+                return (
+                    curve, monotonic, fed_join, self.max_local_steps, [],
+                    LyapunovDecision(False, reason="shadow_dispatch_blocked"),
+                )
+        else:
+            effective_groups = self.arrival_group
         joint = self._joint_policy.enumerate_candidates(
             now=self._virtual_now, groups=self.arrival_group, curve=curve,
         )
-        actions = []
+        effective_scope = self.state_driven_config.lyapunov_action_scope in {
+            "effective_service_v1", "effective_service_v2", "effective_service_v2_1",
+        }
+        if effective_scope:
+            actions = self._effective_service_v1_join_actions(
+                client_id, curve, groups=effective_groups,
+            )
+        else:
+            actions = []
         for candidate in joint:
-            frontier = candidate.expected_arrival_time
+            if effective_scope:
+                break
+            group = self.arrival_group[candidate.group_id]
+            frontier = self._dynamic_group_frontier(group)
+            new_frontier = max(frontier, candidate.predicted_finish_time)
             holding = max(0.0, frontier - candidate.predicted_finish_time)
             external = max(0.0, candidate.predicted_finish_time - frontier)
             actions.append(LyapunovAction(
                 mode="join", group_id=candidate.group_id, q=candidate.q,
                 predicted_finish_time=candidate.predicted_finish_time,
+                predicted_duration=candidate.predicted_finish_time - self._virtual_now,
                 safe_finish_time=candidate.safe_finish_time,
                 group_frontier_time=frontier,
                 latest_arrival_time=candidate.latest_arrival_time,
                 deadline_safe=candidate.deadline_safe,
                 holding_wait=holding, external_wait=external,
-                predicted_sojourn=max(frontier, candidate.predicted_finish_time) - self._virtual_now,
+                affected_pending_clients=len(group.get("clients", [])),
+                predicted_sojourn=new_frontier - self._virtual_now,
                 effective_work=candidate.q / self.max_local_steps,
                 utility=math.log1p(candidate.q / max(self.min_local_steps, 1)),
             ))
@@ -436,25 +908,63 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             qmin=self.min_local_steps, qmax=self.max_local_steps,
         ) if self.arrival_group else self.max_local_steps
         create_point = next((point for point in curve if point.q == fed_new_q), curve[-1])
-        actions.append(LyapunovAction(
-            mode="create", group_id=-1, q=fed_new_q,
-            predicted_finish_time=create_point.predicted_finish_time,
-            safe_finish_time=create_point.safe_finish_time,
-            group_frontier_time=create_point.predicted_finish_time,
-            latest_arrival_time=create_point.safe_finish_time,
-            deadline_safe=True, holding_wait=0.0, external_wait=0.0,
-            predicted_sojourn=create_point.predicted_duration,
-            effective_work=fed_new_q / self.max_local_steps,
-            utility=math.log1p(fed_new_q / max(self.min_local_steps, 1)),
-        ))
+        recruit_expected = recruit_safe = 0.0
+        recruit_expected_raw = recruit_safe_raw = 0.0
+        recruit_safe_cap = math.inf
+        recruitment_source = ""
+        predicted_group_size = 0
+        if scope in {"effective_service_v2", "effective_service_v2_1"}:
+            (
+                create_actions, recruit_expected, recruit_safe,
+                recruitment_source, predicted_group_size,
+                recruit_expected_raw, recruit_safe_raw, recruit_safe_cap,
+            ) = self._effective_service_v2_create_actions(client_id, curve)
+            actions.extend(create_actions)
+        if self.state_driven_config.lyapunov_action_scope == "joint_v1":
+            actions.append(LyapunovAction(
+                mode="create", group_id=-1, q=fed_new_q,
+                predicted_finish_time=create_point.predicted_finish_time,
+                predicted_duration=create_point.predicted_duration,
+                safe_finish_time=create_point.safe_finish_time,
+                group_frontier_time=create_point.predicted_finish_time,
+                latest_arrival_time=create_point.safe_finish_time,
+                deadline_safe=True, holding_wait=0.0, external_wait=0.0,
+                affected_pending_clients=0,
+                predicted_sojourn=create_point.predicted_duration,
+                effective_work=fed_new_q / self.max_local_steps,
+                utility=math.log1p(fed_new_q / max(self.min_local_steps, 1)),
+            ))
+        score_reference_q = (
+            self._lyapunov_q_references.get(client_id, -1)
+            if effective_scope
+            else fed_join.q if fed_join.feasible else -1
+        )
         scored = self._lyapunov_policy.score(
             actions,
             rhythm_debt=self._lyapunov_rhythm_debt,
             workload_debt=self._lyapunov_workload_debt.get(client_id, 0.0),
             qmax=self.max_local_steps, qmin=self.min_local_steps,
-            fedcompass_join_q=fed_join.q if fed_join.feasible else -1,
+            fedcompass_join_q=score_reference_q,
         )
-        return curve, monotonic, fed_join, fed_new_q, scored, self._lyapunov_policy.choose(scored)
+        decision = (
+            self._choose_effective_service_v2(
+                client_id, scored, recruit_expected=recruit_expected,
+                recruit_safe=recruit_safe, recruitment_source=recruitment_source,
+                predicted_group_size=predicted_group_size,
+                recruit_expected_raw=recruit_expected_raw,
+                recruit_safe_raw=recruit_safe_raw,
+                recruit_safe_cap=recruit_safe_cap,
+            )
+            if scope in {"effective_service_v2", "effective_service_v2_1"}
+            else self._lyapunov_policy.choose(scored)
+        )
+        if (
+            scope == "effective_service_v2_1"
+            and self.state_driven_config.lyapunov_mode == "shadow"
+            and decision.action is not None
+        ):
+            self._apply_effective_service_shadow_action(client_id, decision.action)
+        return curve, monotonic, fed_join, fed_new_q, scored, decision
 
     def _record_lyapunov_decision(
         self, client_id: str, scored, decision, *, applied_mode: str,
@@ -463,7 +973,8 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         selected = decision.action if decision.feasible else None
         legal = [action for action in scored if action.legal]
         rejected_holding = sum(
-            action.rejection_reason == "holding_wait_exceeds_cap" for action in scored
+            action.rejection_reason in {"holding_wait_exceeds_cap", "extreme_holding_wait"}
+            for action in scored
         )
         rejected_q = sum(action.rejection_reason == "q_exceeds_trust_region" for action in scored)
         self._lyapunov_decision_trace_buffer.append({
@@ -483,6 +994,20 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             "recommended_sojourn": selected.predicted_sojourn if selected else "",
             "recommended_holding_wait": selected.holding_wait if selected else "",
             "recommended_external_wait": selected.external_wait if selected else "",
+            "recommended_group_frontier": selected.group_frontier_time if selected else "",
+            "recommended_affected_pending": (
+                selected.affected_pending_clients if selected else ""
+            ),
+            "recommended_cadence_excess": (
+                max(
+                    0.0,
+                    selected.predicted_sojourn
+                    - self.state_driven_config.lyapunov_rhythm_target,
+                ) if selected and selected.mode == "join" else 0.0
+            ),
+            "join_cadence_weight": (
+                self.state_driven_config.lyapunov_join_cadence_weight
+            ),
             "applied_mode": applied_mode, "applied_group_id": applied_group,
             "applied_q": applied_q,
             "recommendation_applied": int(
@@ -495,6 +1020,10 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
     def _apply_lyapunov_join(self, client_id: str, action: LyapunovAction) -> None:
         group = self.arrival_group[action.group_id]
         group["clients"].append(client_id)
+        group.setdefault("predicted_finish_times", {})[client_id] = (
+            action.predicted_finish_time
+        )
+        group.setdefault("safe_finish_times", {})[client_id] = action.safe_finish_time
         self.client_info[client_id]["goa"] = action.group_id
         self.client_info[client_id]["local_steps"] = action.q
         self.client_info[client_id]["start_time"] = self._virtual_now
@@ -507,13 +1036,103 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             latest_arrival=group["latest_arrival_time"],
         )
 
+    def _apply_effective_service_create(
+        self, client_id: str, action: LyapunovAction, fed_reference_q: int,
+    ) -> List[VirtualEvent]:
+        """Create the exact group window selected by Effective-Service V2.1."""
+        group_id = self.group_counter
+        self.arrival_group[group_id] = {
+            "clients": [client_id], "arrived_clients": [],
+            "expected_arrival_time": action.group_frontier_time,
+            "latest_arrival_time": action.latest_arrival_time,
+            "created_time": self._virtual_now,
+            "time_source": "effective_service_v2_1_apply",
+            "anchor_client_id": client_id, "anchor_q": action.q,
+            "predicted_finish_times": {client_id: action.predicted_finish_time},
+            "safe_finish_times": {client_id: action.safe_finish_time},
+        }
+        events = [VirtualEvent(
+            time=action.latest_arrival_time,
+            event_type=EventType.FEDCOMPASS_GROUP_DEADLINE,
+            payload={"group_idx": group_id},
+        )]
+        self._deadline_events.add(group_id)
+        self.client_info[client_id]["goa"] = group_id
+        self.client_info[client_id]["local_steps"] = action.q
+        self.client_info[client_id]["start_time"] = self._virtual_now
+        self._record_dispatch_decision(
+            client_id=client_id, decision="effective_service_create_group",
+            assigned_group=group_id, assigned_steps=action.q,
+            speed_raw=float(self.client_info[client_id]["speed"]),
+            remaining_time=None, target_arrival=action.group_frontier_time,
+            latest_arrival=action.latest_arrival_time,
+        )
+        self._state_group_creation_trace_buffer.append({
+            "decision_id": self._decision_id(client_id),
+            "virtual_time": self._virtual_now, "client_id": client_id,
+            "new_group_id": group_id,
+            "new_group_window_mode": "effective_service_v2_1_apply",
+            "new_group_q_mode": "controlled_dual_anchor",
+            "applied": 1, "fedcompass_reference_q": fed_reference_q,
+            "fedcompass_expected_time": "", "fedcompass_latest_time": "",
+            "state_assigned_q": action.q,
+            "state_expected_time": action.group_frontier_time,
+            "state_latest_time": action.latest_arrival_time,
+            "state_safe_finish": action.safe_finish_time,
+            "state_uncertainty": action.safe_finish_time - action.predicted_finish_time,
+            "expected_shift": "", "latest_shift": "",
+            "predictor_source": "effective_service_v2_1",
+            "num_reports": "", "used_fallback": 0, "fallback_reason": "",
+            "safe_window_exceeds_cap": 0,
+        })
+        self.group_counter += 1
+        return events
+
     def _assign_group_lyapunov(self, client_id: str) -> List[VirtualEvent]:
         curve, monotonic, fed_join, fed_new_q, scored, decision = self._lyapunov_actions(client_id)
         fallback = bool(curve) and all(point.used_fallback for point in curve)
-        if fallback or not decision.feasible:
+        if fallback:
             events = self._assign_group_safe_reuse(client_id)
             group = int(self.client_info[client_id].get("goa", -1))
             q = int(self.client_info[client_id].get("local_steps", -1))
+            applied_mode = "join" if not events else "create"
+            self._record_reason_aware_routing_shadow(
+                client_id, curve=curve, scored=scored, decision=decision,
+                applied_mode=applied_mode, applied_group=group, applied_q=q,
+            )
+            self._record_lyapunov_decision(
+                client_id, scored, decision, applied_mode="fallback",
+                applied_group=group, applied_q=q,
+            )
+            return events
+
+        if (
+            not decision.feasible
+            and self.state_driven_config.lyapunov_action_scope == "join_only_v2"
+            and self.state_driven_config.lyapunov_mode == "apply"
+        ):
+            events = self._create_group(client_id)
+            group = int(self.client_info[client_id].get("goa", -1))
+            q = int(self.client_info[client_id].get("local_steps", -1))
+            self._record_reason_aware_routing_shadow(
+                client_id, curve=curve, scored=scored, decision=decision,
+                applied_mode="create", applied_group=group, applied_q=q,
+            )
+            self._record_lyapunov_decision(
+                client_id, scored, decision, applied_mode="create_fallback",
+                applied_group=group, applied_q=q,
+            )
+            return events
+
+        if not decision.feasible:
+            events = self._assign_group_safe_reuse(client_id)
+            group = int(self.client_info[client_id].get("goa", -1))
+            q = int(self.client_info[client_id].get("local_steps", -1))
+            applied_mode = "join" if not events else "create"
+            self._record_reason_aware_routing_shadow(
+                client_id, curve=curve, scored=scored, decision=decision,
+                applied_mode=applied_mode, applied_group=group, applied_q=q,
+            )
             self._record_lyapunov_decision(
                 client_id, scored, decision, applied_mode="fallback",
                 applied_group=group, applied_q=q,
@@ -525,6 +1144,10 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             group = int(self.client_info[client_id].get("goa", -1))
             q = int(self.client_info[client_id].get("local_steps", -1))
             applied_mode = "join" if not events else "create"
+            self._record_reason_aware_routing_shadow(
+                client_id, curve=curve, scored=scored, decision=decision,
+                applied_mode=applied_mode, applied_group=group, applied_q=q,
+            )
             self._record_lyapunov_decision(
                 client_id, scored, decision, applied_mode=applied_mode,
                 applied_group=group, applied_q=q,
@@ -538,12 +1161,21 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             events: List[VirtualEvent] = []
             group = action.group_id
         else:
-            events = self._create_state_group(
-                client_id, action.q, fed_reference_q=fed_new_q,
+            events = (
+                self._apply_effective_service_create(client_id, action, fed_new_q)
+                if self.state_driven_config.lyapunov_action_scope
+                == "effective_service_v2_1"
+                else self._create_state_group(
+                    client_id, action.q, fed_reference_q=fed_new_q,
+                )
             )
             group = int(self.client_info[client_id]["goa"])
         self._record_state_time_points(
             client_id, curve, action.q, fed_join.q, monotonic,
+        )
+        self._record_reason_aware_routing_shadow(
+            client_id, curve=curve, scored=scored, decision=decision,
+            applied_mode=action.mode, applied_group=group, applied_q=action.q,
         )
         self._record_lyapunov_decision(
             client_id, scored, decision, applied_mode=action.mode,
@@ -562,6 +1194,11 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         if self.state_driven_config.lyapunov_mode == "off":
             return
         delta_t = max(0.0, self._virtual_now - self._lyapunov_last_aggregation_time)
+        if int(group_id) >= 0:
+            self._lyapunov_recent_intervals.append(delta_t)
+            self._lyapunov_recent_group_sizes.append(len(local_steps))
+            del self._lyapunov_recent_intervals[:-12]
+            del self._lyapunov_recent_group_sizes[:-12]
         before_h = self._lyapunov_rhythm_debt
         if self.state_driven_config.lyapunov_enable_rhythm_queue:
             self._lyapunov_rhythm_debt = max(
@@ -591,7 +1228,345 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
                 "workload_debt_after": after_z,
                 "participated": int(client_id in local_steps),
             })
+            if client_id in local_steps:
+                self._reason_aware_last_service_time[client_id] = self._virtual_now
         self._lyapunov_last_aggregation_time = self._virtual_now
+
+    def _record_reason_aware_routing_shadow(
+        self, client_id: str, *, curve, scored, decision,
+        applied_mode: str, applied_group: int, applied_q: int,
+    ) -> None:
+        cfg = self.state_driven_config
+        if not cfg.reason_aware_routing_shadow:
+            return
+        selected = decision.action if decision.feasible else None
+        if selected is None and applied_q > 0:
+            applied_point = next(
+                (item for item in curve if item.q == applied_q),
+                min(curve, key=lambda item: abs(item.q - applied_q))
+                if curve else None,
+            )
+            group_state = self.arrival_group.get(applied_group)
+            expected = (
+                float(group_state["expected_arrival_time"])
+                if group_state is not None else (
+                    applied_point.predicted_finish_time
+                    if applied_point is not None else self._virtual_now
+                )
+            )
+            latest = (
+                float(group_state["latest_arrival_time"])
+                if group_state is not None else (
+                    applied_point.safe_finish_time
+                    if applied_point is not None else expected
+                )
+            )
+            predicted_finish = (
+                applied_point.predicted_finish_time
+                if applied_point is not None else expected
+            )
+            safe_finish = (
+                applied_point.safe_finish_time
+                if applied_point is not None else latest
+            )
+            predicted_duration = (
+                applied_point.predicted_duration
+                if applied_point is not None
+                else max(0.0, expected - self._virtual_now)
+            )
+            selected = LyapunovAction(
+                mode=applied_mode,
+                group_id=applied_group,
+                q=applied_q,
+                predicted_finish_time=predicted_finish,
+                predicted_duration=predicted_duration,
+                safe_finish_time=safe_finish,
+                group_frontier_time=expected,
+                latest_arrival_time=latest,
+                deadline_safe=safe_finish <= latest,
+                holding_wait=max(0.0, expected - predicted_finish),
+                external_wait=0.0,
+                affected_pending_clients=0,
+                predicted_sojourn=max(0.0, expected - self._virtual_now),
+                effective_work=applied_q / self.max_local_steps,
+                utility=1.0,
+                score=0.0,
+                legal=True,
+            )
+        point = None
+        if selected is not None:
+            point = next((item for item in curve if item.q == selected.q), None)
+        if point is None and curve:
+            point = min(curve, key=lambda item: item.q)
+        cause = classify_slow_cause(point)
+        structural = None
+        state = self._runtime_states.get(client_id)
+        if (
+            cfg.reason_aware_one_report_structural_shadow
+            and selected is not None
+            and state is not None
+            and int(getattr(state, "num_reports", 0)) == 1
+        ):
+            observed_q = max(
+                1, int(round(
+                    float(getattr(state, "round_time_mean", 0.0))
+                    / max(float(getattr(state, "step_time_mean", 0.0)), 1e-12)
+                )),
+            )
+            structural = predict_one_report_structural(
+                q=selected.q,
+                observed_q=observed_q,
+                observed_round_duration=float(
+                    getattr(state, "round_time_mean", 0.0)
+                ),
+                observed_compute_duration=(
+                    float(getattr(state, "compute_step_time_mean", 0.0))
+                    * observed_q
+                ),
+                observed_communication_duration=float(
+                    getattr(state, "communication_time_mean", 0.0)
+                ),
+                observed_spike_duration=float(
+                    getattr(state, "spike_delay_mean", 0.0)
+                ),
+                observed_availability_duration=float(
+                    getattr(state, "availability_wait_mean", 0.0)
+                ),
+                num_reports=1,
+                communication_ratio_gate=(
+                    cfg.reason_aware_one_report_communication_gate
+                ),
+                safety_fraction=(
+                    cfg.reason_aware_one_report_safety_fraction
+                ),
+            )
+            if structural.eligible:
+                total = max(structural.predicted_duration, 1e-12)
+                cause = SlowCause(
+                    label="extreme_communication_bound",
+                    confidence=structural.communication_ratio,
+                    compute_ratio=structural.compute_duration / total,
+                    communication_ratio=(
+                        structural.fixed_duration / total
+                    ),
+                    availability_ratio=0.0,
+                    spike_ratio=0.0,
+                    mature=False,
+                )
+        last_service = self._reason_aware_last_service_time.get(client_id, 0.0)
+        service_age = max(0.0, self._virtual_now - last_service)
+        service_age_periods = (
+            service_age / cfg.lyapunov_rhythm_target
+            if cfg.lyapunov_rhythm_target > 0 else 0.0
+        )
+        recent = self._lyapunov_recent_intervals[-4:]
+        recent_median = (
+            sorted(recent)[len(recent) // 2] if recent else math.inf
+        )
+        recent_max = max(recent) if recent else math.inf
+        at_risk_groups = sum(
+            self._dynamic_group_safe_frontier(group)
+            > float(group["latest_arrival_time"])
+            for group in self.arrival_group.values()
+            if group.get("clients")
+        )
+        system_healthy = bool(
+            recent
+            and recent_median
+            <= cfg.reason_aware_cadence_median_ratio * cfg.lyapunov_rhythm_target
+            and recent_max
+            <= cfg.reason_aware_cadence_max_ratio * cfg.lyapunov_rhythm_target
+            and at_risk_groups == 0
+        )
+        route = recommend_reason_aware_route(
+            cause=cause,
+            v23_action=selected,
+            scored_actions=scored,
+            service_age_periods=service_age_periods,
+            minimum_anchor_age_periods=cfg.reason_aware_min_anchor_age_periods,
+            system_healthy=system_healthy,
+            background_sojourn_periods=cfg.reason_aware_background_sojourn_periods,
+            rhythm_target=cfg.lyapunov_rhythm_target,
+        )
+        if (
+            structural is not None
+            and structural.eligible
+            and selected is not None
+            and selected.mode == "create"
+        ):
+            # The real V2.3 group is created immediately after this Shadow
+            # record.  Preserve a counterfactual window keyed by that real id
+            # so later dispatches can observe the corrected cadence cost
+            # without mutating the real group.
+            self._reason_aware_structural_group_windows[applied_group] = (
+                self._virtual_now + structural.predicted_duration,
+                self._virtual_now + structural.safe_duration,
+            )
+        corrected_window = (
+            self._reason_aware_structural_group_windows.get(selected.group_id)
+            if selected is not None and selected.mode == "join" else None
+        )
+        corrected_sojourn = (
+            max(0.0, corrected_window[0] - self._virtual_now)
+            if corrected_window else 0.0
+        )
+        corrected_cadence_excess = max(
+            0.0, corrected_sojourn - cfg.lyapunov_rhythm_target
+        )
+        elastic_join_avoidance = False
+        if (
+            corrected_window is not None
+            and corrected_cadence_excess > 0.0
+            and cause.label != "extreme_communication_bound"
+            and selected is not None
+        ):
+            create = min(
+                (
+                    action for action in scored
+                    if action.legal
+                    and action.mode == "create"
+                    and action.q == selected.q
+                ),
+                key=lambda action: (action.score, action.predicted_sojourn),
+                default=None,
+            )
+            if create is not None:
+                route = ReasonAwareRoute(
+                    lane="elastic_unified",
+                    mode="create",
+                    group_id=-1,
+                    q=selected.q,
+                    reason="corrected_anchor_cadence_avoidance",
+                    compatible_background_group=-1,
+                    anchor_eligible=False,
+                    changed=True,
+                )
+                elastic_join_avoidance = True
+        shadow_action = next((
+            action for action in scored
+            if (
+                action.legal
+                and action.mode == route.mode
+                and action.group_id == route.group_id
+            )
+        ), selected)
+        self._reason_aware_routing_trace_buffer.append({
+            "decision_id": self._decision_id(client_id),
+            "virtual_time": self._virtual_now,
+            "client_id": client_id,
+            "slow_cause": cause.label,
+            "classification_confidence": cause.confidence,
+            "predictor_mature": int(cause.mature),
+            "compute_ratio": cause.compute_ratio,
+            "communication_ratio": cause.communication_ratio,
+            "availability_ratio": cause.availability_ratio,
+            "spike_ratio": cause.spike_ratio,
+            "service_age": service_age,
+            "service_age_periods": service_age_periods,
+            "recent_cadence_median": recent_median if recent else "",
+            "recent_cadence_max": recent_max if recent else "",
+            "rhythm_debt": self._lyapunov_rhythm_debt,
+            "active_groups": len(self.arrival_group),
+            "at_risk_groups": at_risk_groups,
+            "system_healthy": int(system_healthy),
+            "recommended_lane": route.lane,
+            "route_reason": route.reason,
+            "compatible_background_group": route.compatible_background_group,
+            "anchor_eligible": int(route.anchor_eligible),
+            "v23_mode": applied_mode,
+            "v23_group_id": applied_group,
+            "v23_q": applied_q,
+            "shadow_mode": route.mode,
+            "shadow_group_id": route.group_id,
+            # Structural invariant: Reason-Aware Shadow never changes Q.
+            "shadow_q": route.q,
+            "q_unchanged": int(route.q == applied_q),
+            "recommendation_changed": int(
+                route.mode != applied_mode
+                or (
+                    route.mode == "join"
+                    and route.group_id != applied_group
+                )
+            ),
+            "shadow_predicted_sojourn": (
+                shadow_action.predicted_sojourn if shadow_action else ""
+            ),
+            "shadow_holding_wait": (
+                shadow_action.holding_wait if shadow_action else ""
+            ),
+            "shadow_external_wait": (
+                shadow_action.external_wait if shadow_action else ""
+            ),
+            "shadow_cadence_excess": (
+                max(
+                    0.0,
+                    shadow_action.predicted_sojourn - cfg.lyapunov_rhythm_target,
+                ) if shadow_action and shadow_action.mode == "join" else 0.0
+            ),
+            "shadow_deadline_safe": (
+                int(shadow_action.deadline_safe) if shadow_action else ""
+            ),
+            "shadow_safety_slack": (
+                shadow_action.latest_arrival_time
+                - shadow_action.safe_finish_time
+                if shadow_action else ""
+            ),
+            "one_report_structural_enabled": int(
+                cfg.reason_aware_one_report_structural_shadow
+            ),
+            "one_report_structural_eligible": int(
+                structural is not None and structural.eligible
+            ),
+            "one_report_structural_reason": (
+                structural.reason if structural else "not_evaluated"
+            ),
+            "one_report_structural_q": (
+                structural.q if structural else ""
+            ),
+            "one_report_structural_predicted_duration": (
+                structural.predicted_duration if structural else ""
+            ),
+            "one_report_structural_safe_duration": (
+                structural.safe_duration if structural else ""
+            ),
+            "one_report_structural_predicted_finish": (
+                self._virtual_now + structural.predicted_duration
+                if structural else ""
+            ),
+            "one_report_structural_safe_finish": (
+                self._virtual_now + structural.safe_duration
+                if structural else ""
+            ),
+            "one_report_structural_fixed_duration": (
+                structural.fixed_duration if structural else ""
+            ),
+            "one_report_structural_compute_duration": (
+                structural.compute_duration if structural else ""
+            ),
+            "one_report_structural_communication_ratio": (
+                structural.communication_ratio if structural else ""
+            ),
+            "one_report_structural_q_unchanged": int(
+                structural is None
+                or structural.q == applied_q
+            ),
+            "structural_group_window_active": int(
+                corrected_window is not None
+            ),
+            "structural_group_expected_time": (
+                corrected_window[0] if corrected_window else ""
+            ),
+            "structural_group_latest_time": (
+                corrected_window[1] if corrected_window else ""
+            ),
+            "structural_group_sojourn": (
+                corrected_sojourn if corrected_window else ""
+            ),
+            "structural_group_cadence_excess": (
+                corrected_cadence_excess if corrected_window else ""
+            ),
+            "elastic_join_avoidance": int(elastic_join_avoidance),
+        })
 
     def _create_group(self, client_id: str) -> List[VirtualEvent]:
         cfg = self.state_driven_config
@@ -779,6 +1754,8 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             "expected_arrival_time": expected, "latest_arrival_time": latest,
             "created_time": self._virtual_now, "time_source": time_source,
             "anchor_client_id": client_id, "anchor_q": q,
+            "predicted_finish_times": {client_id: point.predicted_finish_time},
+            "safe_finish_times": {client_id: point.safe_finish_time},
         }
         events = []
         if group_id not in self._deadline_events:
@@ -845,4 +1822,25 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
 
     def pop_lyapunov_queue_traces(self):
         rows, self._lyapunov_queue_trace_buffer = self._lyapunov_queue_trace_buffer, []
+        return rows
+
+    def pop_effective_service_q_traces(self):
+        rows = self._effective_service_q_trace_buffer
+        self._effective_service_q_trace_buffer = []
+        return rows
+
+    def pop_effective_service_region_traces(self):
+        rows = self._effective_service_region_trace_buffer
+        self._effective_service_region_trace_buffer = []
+        return rows
+
+    def pop_effective_service_shadow_outcome_traces(self):
+        self._settle_effective_service_shadow_groups()
+        rows = self._effective_service_shadow_outcome_trace_buffer
+        self._effective_service_shadow_outcome_trace_buffer = []
+        return rows
+
+    def pop_reason_aware_routing_traces(self):
+        rows = self._reason_aware_routing_trace_buffer
+        self._reason_aware_routing_trace_buffer = []
         return rows

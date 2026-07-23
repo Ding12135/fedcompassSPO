@@ -363,6 +363,20 @@ def run_experiment(args: argparse.Namespace) -> None:
             for row in controller.pop_lyapunov_queue_traces():
                 trace.record_lyapunov_queue(row)
 
+        if hasattr(controller, "pop_effective_service_q_traces"):
+            for row in controller.pop_effective_service_q_traces():
+                trace.record_effective_service_q(row)
+        if hasattr(controller, "pop_effective_service_region_traces"):
+            for row in controller.pop_effective_service_region_traces():
+                trace.record_effective_service_region(row)
+        if hasattr(controller, "pop_effective_service_shadow_outcome_traces"):
+            for row in controller.pop_effective_service_shadow_outcome_traces():
+                trace.record_effective_service_shadow_outcome(row)
+
+        if hasattr(controller, "pop_reason_aware_routing_traces"):
+            for row in controller.pop_reason_aware_routing_traces():
+                trace.record_reason_aware_routing(row)
+
         if hasattr(controller, "pop_state_q_traces"):
             for state_q in controller.pop_state_q_traces():
                 trace.record_state_q_decision(state_q)
@@ -792,6 +806,9 @@ def _state_driven_config_from_args(args) -> StateDrivenConfig:
         calibrated_predictor_shadow=args.sd_calibrated_predictor_shadow == "on",
         predictor_native_new_group_shadow=args.sd_predictor_native_new_group_shadow == "on",
         calibrated_shadow_target_coverage=args.sd_calibrated_shadow_target_coverage,
+        finite_sample_safety_calibration=(
+            args.sd_finite_sample_safety_calibration == "on"
+        ),
         lyapunov_mode=args.sd_lyapunov_mode,
         lyapunov_rhythm_target=args.sd_lyapunov_rhythm_target,
         lyapunov_v=args.sd_lyapunov_v,
@@ -801,6 +818,35 @@ def _state_driven_config_from_args(args) -> StateDrivenConfig:
         lyapunov_enable_rhythm_queue=args.sd_lyapunov_rhythm_queue == "on",
         lyapunov_enable_workload_queue=args.sd_lyapunov_workload_queue == "on",
         lyapunov_client_target_rates=args.sd_lyapunov_client_target_rates,
+        lyapunov_action_scope=args.sd_lyapunov_action_scope,
+        lyapunov_holding_weight=args.sd_lyapunov_holding_weight,
+        lyapunov_max_holding_ratio=args.sd_lyapunov_max_holding_ratio,
+        lyapunov_q_reference_spec=args.sd_lyapunov_q_reference_spec,
+        lyapunov_region_extension_ratio=args.sd_lyapunov_region_extension_ratio,
+        lyapunov_create_hysteresis=args.sd_lyapunov_create_hysteresis,
+        lyapunov_recruit_safe_cap_ratio=args.sd_lyapunov_recruit_safe_cap_ratio,
+        lyapunov_create_safe_cost=args.sd_lyapunov_create_safe_cost == "on",
+        lyapunov_join_cadence_weight=args.sd_lyapunov_join_cadence_weight,
+        reason_aware_routing_shadow=args.sd_reason_aware_routing_shadow == "on",
+        reason_aware_min_anchor_age_periods=(
+            args.sd_reason_aware_min_anchor_age_periods
+        ),
+        reason_aware_background_sojourn_periods=(
+            args.sd_reason_aware_background_sojourn_periods
+        ),
+        reason_aware_cadence_median_ratio=(
+            args.sd_reason_aware_cadence_median_ratio
+        ),
+        reason_aware_cadence_max_ratio=args.sd_reason_aware_cadence_max_ratio,
+        reason_aware_one_report_structural_shadow=(
+            args.sd_reason_aware_one_report_structural_shadow == "on"
+        ),
+        reason_aware_one_report_communication_gate=(
+            args.sd_reason_aware_one_report_communication_gate
+        ),
+        reason_aware_one_report_safety_fraction=(
+            args.sd_reason_aware_one_report_safety_fraction
+        ),
         min_group_slack=args.sd_min_group_slack,
         max_group_slack=args.sd_max_group_slack,
     )
@@ -1000,6 +1046,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sd_calibrated_predictor_shadow", choices=["on", "off"], default="on")
     parser.add_argument("--sd_predictor_native_new_group_shadow", choices=["on", "off"], default="on")
     parser.add_argument("--sd_calibrated_shadow_target_coverage", type=float, default=0.85)
+    parser.add_argument(
+        "--sd_finite_sample_safety_calibration",
+        choices=["on", "off"], default="off",
+    )
     parser.add_argument("--sd_lyapunov_mode", choices=["off", "shadow", "apply"], default="off")
     parser.add_argument("--sd_lyapunov_rhythm_target", type=float, default=16.4)
     parser.add_argument("--sd_lyapunov_v", type=float, default=1.0)
@@ -1009,6 +1059,49 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--sd_lyapunov_rhythm_queue", choices=["on", "off"], default="on")
     parser.add_argument("--sd_lyapunov_workload_queue", choices=["on", "off"], default="on")
     parser.add_argument("--sd_lyapunov_client_target_rates", type=str, default="")
+    parser.add_argument(
+        "--sd_lyapunov_action_scope",
+        choices=[
+            "joint_v1", "join_only_v2", "effective_service_v1",
+            "effective_service_v2", "effective_service_v2_1",
+        ],
+        default="joint_v1",
+    )
+    parser.add_argument("--sd_lyapunov_holding_weight", type=float, default=0.0)
+    parser.add_argument("--sd_lyapunov_max_holding_ratio", type=float, default=1000000.0)
+    parser.add_argument("--sd_lyapunov_q_reference_spec", type=str, default="")
+    parser.add_argument("--sd_lyapunov_region_extension_ratio", type=float, default=0.10)
+    parser.add_argument("--sd_lyapunov_create_hysteresis", type=float, default=0.10)
+    parser.add_argument("--sd_lyapunov_recruit_safe_cap_ratio", type=float, default=1000000.0)
+    parser.add_argument("--sd_lyapunov_create_safe_cost", choices=["on", "off"], default="off")
+    parser.add_argument("--sd_lyapunov_join_cadence_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--sd_reason_aware_routing_shadow", choices=["on", "off"], default="off",
+    )
+    parser.add_argument(
+        "--sd_reason_aware_min_anchor_age_periods", type=float, default=4.0,
+    )
+    parser.add_argument(
+        "--sd_reason_aware_background_sojourn_periods", type=float, default=2.0,
+    )
+    parser.add_argument(
+        "--sd_reason_aware_cadence_median_ratio", type=float, default=1.25,
+    )
+    parser.add_argument(
+        "--sd_reason_aware_cadence_max_ratio", type=float, default=2.0,
+    )
+    parser.add_argument(
+        "--sd_reason_aware_one_report_structural_shadow",
+        choices=["on", "off"], default="off",
+    )
+    parser.add_argument(
+        "--sd_reason_aware_one_report_communication_gate",
+        type=float, default=0.95,
+    )
+    parser.add_argument(
+        "--sd_reason_aware_one_report_safety_fraction",
+        type=float, default=0.10,
+    )
     parser.add_argument("--sd_min_group_slack", type=float, default=0.5)
     parser.add_argument("--sd_max_group_slack", type=float, default=120.0)
 

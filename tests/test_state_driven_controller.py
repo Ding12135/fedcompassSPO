@@ -54,6 +54,34 @@ def _base(controller):
 
 
 class StateDrivenControllerTest(unittest.TestCase):
+    @staticmethod
+    def _warm_pooled_safety(controller):
+        for index in range(8):
+            client_id = f"warm_{index}"
+            controller._calibrated_shadow.predict(
+                client_id=client_id, local_steps=40,
+                baseline_duration=4.0, baseline_safe_duration=5.0,
+            )
+            controller._calibrated_shadow.observe(
+                client_id=client_id, local_steps=40, actual_duration=5.0,
+                compute_duration=4.0, communication_duration=1.0,
+            )
+
+    def test_dynamic_frontier_uses_only_current_pending_predictions(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=2, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(),
+        ))
+        group = {
+            "clients": ["client_0"],
+            "expected_arrival_time": 80.0,
+            "latest_arrival_time": 100.0,
+            "predicted_finish_times": {"client_0": 30.0, "finished": 90.0},
+        }
+        self.assertEqual(controller._dynamic_group_frontier(group), 30.0)
+
     def test_lyapunov_queue_updates_only_from_real_aggregation(self):
         controller = _base(VirtualStateDrivenCompassController(
             aggregator=object(), num_clients=1, min_local_steps=40,
@@ -96,6 +124,206 @@ class StateDrivenControllerTest(unittest.TestCase):
         trace = controller.pop_lyapunov_decision_traces()[0]
         self.assertEqual(trace["mode"], "shadow")
         self.assertEqual(trace["applied_mode"], "join")
+
+    def test_effective_service_v2_region_three_recommends_controlled_create(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="shadow",
+                lyapunov_action_scope="effective_service_v2",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=80",
+                finite_sample_safety_calibration=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller._assign_group("client_0")
+        region = controller.pop_effective_service_region_traces()[0]
+        self.assertEqual(region["region"], "region_3")
+        self.assertEqual(region["recommended_mode"], "create")
+        self.assertIn(region["recommended_q"], {40, 64, 80, 88})
+
+    def test_effective_service_v2_obvious_join_blocks_create_competition(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                lyapunov_mode="shadow", lyapunov_action_scope="effective_service_v2",
+            ),
+        ))
+        join = SimpleNamespace(
+            legal=True, mode="join", external_wait=0.1, holding_wait=1.0, score=1.0,
+            q=80, group_id=3,
+        )
+        create = SimpleNamespace(
+            legal=True, mode="create", external_wait=10.0, holding_wait=10.0,
+            score=-10.0,
+            q=80, group_id=-1,
+        )
+        decision = controller._choose_effective_service_v2(
+            "client_0", [join, create], recruit_expected=10.0,
+            recruit_safe=12.0, recruitment_source="test",
+            predicted_group_size=2,
+        )
+        self.assertEqual(decision.action.mode, "join")
+        self.assertEqual(
+            controller.pop_effective_service_region_traces()[0]["region"],
+            "region_1",
+        )
+
+    def test_effective_service_v2_1_cold_start_defers_to_safe_reuse(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="shadow",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=80",
+                finite_sample_safety_calibration=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller._assign_group("client_0")
+        region = controller.pop_effective_service_region_traces()[0]
+        self.assertEqual(region["region"], "cold_start")
+        self.assertEqual(region["recommended_mode"], "defer")
+        self.assertIsNone(controller._effective_service_shadow_groups)
+
+    def test_effective_service_v2_1_create_becomes_joinable_shadow_group(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=2, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="shadow",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=80,client_1=80",
+                finite_sample_safety_calibration=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        self._warm_pooled_safety(controller)
+        controller._assign_group("client_0")
+        first = controller.pop_effective_service_region_traces()[0]
+        self.assertEqual(first["recommended_mode"], "create")
+        controller.client_info["client_1"] = {
+            "speed": 0.1, "timestamp": 0, "local_steps": 100, "goa": -1,
+        }
+        controller._client_dispatch_index["client_1"] = 0
+        controller._virtual_now = 6.0
+        controller._assign_group("client_1")
+        second = controller.pop_effective_service_region_traces()[0]
+        self.assertEqual(second["recommended_mode"], "join")
+        groups = controller._effective_service_shadow_groups
+        self.assertEqual(len(groups), 1)
+        self.assertEqual(len(next(iter(groups.values()))["clients"]), 2)
+
+    def test_effective_service_v2_1_seed_ignores_expired_and_empty_groups(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=2, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                lyapunov_mode="shadow",
+                lyapunov_action_scope="effective_service_v2_1",
+            ),
+        ))
+        controller.arrival_group = {
+            1: {"clients": ["client_0"], "latest_arrival_time": 5.0},
+            2: {"clients": [], "latest_arrival_time": 20.0},
+            3: {"clients": ["client_1"], "latest_arrival_time": 20.0},
+        }
+        groups = controller._ensure_effective_service_shadow_groups()
+        self.assertEqual(set(groups), {3})
+        self.assertEqual(groups[3]["clients"], ["client_1"])
+        self.assertEqual(controller.pop_effective_service_shadow_outcome_traces(), [])
+
+    def test_effective_service_v2_1_blocks_duplicate_counterfactual_dispatch(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="shadow",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=80",
+                finite_sample_safety_calibration=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        self._warm_pooled_safety(controller)
+        controller._assign_group("client_0")
+        controller.pop_effective_service_region_traces()
+        controller._virtual_now = 6.0
+        controller._prepare_next_decision("client_0")
+        *_, decision = controller._lyapunov_actions("client_0")
+        self.assertFalse(decision.feasible)
+        region = controller.pop_effective_service_region_traces()[0]
+        self.assertEqual(region["reason"], "shadow_dispatch_blocked")
+
+    def test_effective_service_v2_1_apply_uses_selected_create_window(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass", lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=80",
+                finite_sample_safety_calibration=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        self._warm_pooled_safety(controller)
+        events = controller._assign_group("client_0")
+        group = next(iter(controller.arrival_group.values()))
+        self.assertEqual(group["time_source"], "effective_service_v2_1_apply")
+        self.assertEqual(events[0].time, group["latest_arrival_time"])
+        self.assertIsNone(controller._effective_service_shadow_groups)
+
+    def test_effective_service_v2_2_clips_and_prices_recruitment_safe_time(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_q_reference_spec="client_0=80",
+                finite_sample_safety_calibration=True,
+                lyapunov_recruit_safe_cap_ratio=2.0,
+                lyapunov_create_safe_cost=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        self._warm_pooled_safety(controller)
+        controller._lyapunov_recent_intervals = [10.0] * 9 + [20.0, 99.0, 120.0]
+        curve, _ = controller._curve("client_0")
+        actions, expected, safe, source, _, expected_raw, raw, cap = (
+            controller._effective_service_v2_create_actions("client_0", curve)
+        )
+        self.assertEqual(expected_raw, 10.0)
+        self.assertEqual(raw, 120.0)
+        self.assertAlmostEqual(cap, 32.8)
+        self.assertAlmostEqual(safe, 32.8)
+        self.assertIn("rhythm_trust_clipped", source)
+        self.assertTrue(all(
+            action.predicted_sojourn == action.predicted_duration + safe
+            for action in actions
+        ))
 
     def test_lyapunov_apply_can_create_instead_of_long_holding_join(self):
         controller = _base(VirtualStateDrivenCompassController(
@@ -155,6 +383,29 @@ class StateDrivenControllerTest(unittest.TestCase):
             from pathlib import Path
             self.assertTrue((Path(directory) / "lyapunov_decision_trace.csv").exists())
             self.assertTrue((Path(directory) / "lyapunov_queue_trace.csv").exists())
+
+    def test_effective_service_region_trace_flushes_cold_and_guarded_rows(self):
+        with TemporaryDirectory() as directory:
+            writer = TraceWriter(directory, "state_driven_compass")
+            writer.record_effective_service_region({
+                "decision_id": "cold", "region": "cold_start",
+                "recruitment_expected": "", "recruitment_safe": "",
+            })
+            writer.record_effective_service_region({
+                "decision_id": "guarded", "region": "region_3",
+                "recruitment_expected": 16.4,
+                "recruitment_expected_raw": 60.0,
+                "recruitment_safe": 32.8,
+                "recruitment_safe_raw": 99.0,
+                "recruitment_safe_cap": 32.8,
+                "create_safe_cost_enabled": 1,
+            })
+            writer.flush()
+            from pathlib import Path
+            path = Path(directory) / "effective_service_region_shadow_trace.csv"
+            self.assertTrue(path.exists())
+            self.assertIn("recruitment_safe_cap", path.read_text())
+
     def test_state_group_uses_predicted_and_safe_finish(self):
         controller = _base(VirtualStateDrivenCompassController(
             aggregator=object(), num_clients=1, min_local_steps=40,
@@ -212,6 +463,31 @@ class StateDrivenControllerTest(unittest.TestCase):
         self.assertEqual(group["expected_arrival_time"], 25.0)
         self.assertEqual(group["latest_arrival_time"], 29.0)
         self.assertEqual(group["time_source"], "fedcompass_speed")
+
+    def test_reason_shadow_closes_against_real_fallback_action(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass",
+                lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                reason_aware_routing_shadow=True,
+                reason_aware_one_report_structural_shadow=True,
+            ),
+        ))
+        controller._state_time_model = _FallbackTimeModel()
+        events = controller._assign_group("client_0")
+        self.assertTrue(events)
+        row = controller.pop_reason_aware_routing_traces()[0]
+        self.assertEqual(row["v23_mode"], "create")
+        self.assertEqual(row["v23_group_id"], 0)
+        self.assertEqual(row["v23_q"], 200)
+        self.assertEqual(row["shadow_q"], 200)
+        self.assertEqual(row["q_unchanged"], 1)
 
     def test_fallback_join_executes_parent_policy(self):
         controller = _base(VirtualStateDrivenCompassController(
