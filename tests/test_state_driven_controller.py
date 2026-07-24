@@ -5,6 +5,13 @@ from tempfile import TemporaryDirectory
 
 from su_compass.scheduling.state_driven_config import StateDrivenConfig
 from su_compass.scheduling.state_time_model import QTimeCandidate
+from su_compass.scheduling.policies.lyapunov_group_q import (
+    LyapunovAction,
+    LyapunovDecision,
+)
+from su_compass.scheduling.policies.fair_contribution_state import (
+    FairContributionState,
+)
 from su_compass.virtual.algorithms.fedcompass import VirtualFedCompassController
 from su_compass.virtual.algorithms.state_driven_compass import VirtualStateDrivenCompassController
 from su_compass.virtual.event import EventType, VirtualEvent
@@ -488,6 +495,216 @@ class StateDrivenControllerTest(unittest.TestCase):
         self.assertEqual(row["v23_q"], 200)
         self.assertEqual(row["shadow_q"], 200)
         self.assertEqual(row["q_unchanged"], 1)
+
+    def test_reason_shadow_uses_applied_q_not_unapplied_candidate_q(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass",
+                lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=47",
+                reason_aware_routing_shadow=True,
+                reason_aware_one_report_structural_shadow=True,
+                fair_contribution_shadow=True,
+                communication_amortized_q_shadow=True,
+            ),
+        ))
+        controller._fair_contribution_state = FairContributionState(
+            ["client_0"],
+        )
+        controller._fair_contribution_state.raw_debt["client_0"] = 1.0
+        controller._state_time_model = _FallbackTimeModel()
+        controller._runtime_states["client_0"] = SimpleNamespace(
+            num_reports=1,
+            round_time_mean=150.0,
+            step_time_mean=0.75,
+            compute_step_time_mean=0.02,
+            communication_time_mean=146.0,
+            spike_delay_mean=0.0,
+            availability_wait_mean=0.0,
+        )
+        controller.arrival_group = {
+            0: {
+                "clients": [], "arrived_clients": [],
+                "expected_arrival_time": 45.0,
+                "latest_arrival_time": 55.0,
+                "created_time": 5.0,
+            },
+        }
+        curve, _ = controller._curve("client_0")
+        candidate = LyapunovAction(
+            mode="create", group_id=-1, q=40,
+            predicted_finish_time=35.0, predicted_duration=30.0,
+            safe_finish_time=35.0, group_frontier_time=35.0,
+            latest_arrival_time=35.0, deadline_safe=True,
+            holding_wait=0.0, external_wait=0.0,
+            affected_pending_clients=0, predicted_sojourn=30.0,
+            effective_work=0.2, utility=1.0, score=0.0, legal=True,
+        )
+        controller._record_reason_aware_routing_shadow(
+            "client_0", curve=curve, scored=[candidate],
+            decision=LyapunovDecision(True, candidate),
+            applied_mode="create", applied_group=0, applied_q=48,
+        )
+        row = controller.pop_reason_aware_routing_traces()[0]
+        self.assertEqual(row["v23_q"], 48)
+        self.assertEqual(row["shadow_q"], 48)
+        self.assertEqual(row["one_report_structural_q"], 48)
+        self.assertEqual(row["q_unchanged"], 1)
+        self.assertEqual(row["one_report_structural_q_unchanged"], 1)
+        # Cold one-report structural evidence may explain the duration, but it
+        # must not bypass the common health and service-age gates for Q.
+        self.assertEqual(row["communication_amortized_q_eligible"], 0)
+        self.assertEqual(row["communication_amortized_q"], 48)
+        self.assertEqual(row["communication_amortized_q_added"], 0)
+
+    def test_required_same_q_create_candidate_is_added_within_trust_region(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass",
+                lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=84",
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        curve, _ = controller._curve("client_0")
+        for reference_q, required_q in (
+            (188, 200), (174, 192), (156, 172),
+            (111, 123), (84, 93), (64, 71),
+        ):
+            controller._lyapunov_q_references["client_0"] = reference_q
+            actions, *_ = controller._effective_service_v2_create_actions(
+                "client_0", curve, required_q=required_q,
+            )
+            self.assertIn(required_q, {action.q for action in actions})
+
+    def test_corrected_long_group_avoids_join_with_same_applied_q(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass",
+                lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=84",
+                reason_aware_routing_shadow=True,
+                reason_aware_one_report_structural_shadow=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller.arrival_group = {
+            10: {
+                "clients": [], "arrived_clients": [],
+                "expected_arrival_time": 30.0,
+                "latest_arrival_time": 40.0,
+                "created_time": 0.0,
+            },
+        }
+        controller._reason_aware_structural_group_windows[10] = (150.0, 170.0)
+        curve, _ = controller._curve("client_0")
+        controller._record_reason_aware_routing_shadow(
+            "client_0", curve=curve, scored=[],
+            decision=LyapunovDecision(False),
+            applied_mode="join", applied_group=10, applied_q=93,
+        )
+        row = controller.pop_reason_aware_routing_traces()[0]
+        self.assertEqual(row["v23_q"], 93)
+        self.assertEqual(row["shadow_mode"], "create")
+        self.assertEqual(row["shadow_q"], 93)
+        self.assertEqual(row["q_unchanged"], 1)
+        self.assertEqual(row["same_q_create_candidate"], 1)
+        self.assertEqual(row["same_q_create_legal"], 1)
+        self.assertEqual(row["elastic_join_avoidance"], 1)
+
+    def test_mature_long_join_uses_common_cadence_limit(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(
+                new_group_window_mode="state_apply_fixed_q",
+                new_group_q_mode="fedcompass",
+                lyapunov_mode="apply",
+                lyapunov_action_scope="effective_service_v2_1",
+                lyapunov_enable_workload_queue=False,
+                lyapunov_q_reference_spec="client_0=84",
+                reason_aware_routing_shadow=True,
+            ),
+        ))
+        controller._state_time_model = _FakeTimeModel()
+        controller.arrival_group = {
+            34: {
+                "clients": ["slow"], "arrived_clients": [],
+                "expected_arrival_time": 40.0,
+                "latest_arrival_time": 50.0,
+                "created_time": 0.0,
+            },
+        }
+        curve, _ = controller._curve("client_0")
+        controller._record_reason_aware_routing_shadow(
+            "client_0", curve=curve, scored=[],
+            decision=LyapunovDecision(False),
+            applied_mode="join", applied_group=34, applied_q=93,
+        )
+        row = controller.pop_reason_aware_routing_traces()[0]
+        self.assertGreater(
+            row["join_observed_sojourn"], row["join_cadence_limit"],
+        )
+        self.assertEqual(row["mature_long_join_avoidance"], 1)
+        self.assertEqual(row["shadow_mode"], "create")
+        self.assertEqual(row["shadow_q"], 93)
+        self.assertEqual(row["q_unchanged"], 1)
+        self.assertEqual(row["elastic_join_avoidance"], 1)
+
+    def test_same_time_avoidance_is_coordinated_into_one_widest_anchor(self):
+        controller = _base(VirtualStateDrivenCompassController(
+            aggregator=object(), num_clients=1, min_local_steps=40,
+            max_local_steps=200, speed_momentum=0.9,
+            latest_time_factor=1.2, num_global_epochs=10,
+            state_driven_config=StateDrivenConfig(),
+        ))
+        controller._reason_aware_routing_trace_buffer = [
+            {
+                "virtual_time": 10.0, "client_id": "client_0",
+                "elastic_join_avoidance": 1,
+                "same_q_create_latest_time": 40.0,
+                "shadow_mode": "create", "shadow_group_id": -1,
+            },
+            {
+                "virtual_time": 10.0, "client_id": "client_7",
+                "elastic_join_avoidance": 1,
+                "same_q_create_latest_time": 55.0,
+                "shadow_mode": "create", "shadow_group_id": -1,
+            },
+            {
+                "virtual_time": 10.0, "client_id": "client_3",
+                "elastic_join_avoidance": 1,
+                "same_q_create_latest_time": 45.0,
+                "shadow_mode": "create", "shadow_group_id": -1,
+            },
+        ]
+        rows = controller.pop_reason_aware_routing_traces()
+        roles = {row["client_id"]: row["coordinated_batch_role"] for row in rows}
+        self.assertEqual(roles["client_7"], "anchor")
+        self.assertEqual(roles["client_0"], "join")
+        self.assertEqual(roles["client_3"], "join")
+        self.assertEqual(
+            len({row["coordinated_batch_group_id"] for row in rows}), 1,
+        )
 
     def test_fallback_join_executes_parent_policy(self):
         controller = _base(VirtualStateDrivenCompassController(

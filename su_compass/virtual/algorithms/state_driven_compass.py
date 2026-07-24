@@ -31,6 +31,15 @@ from su_compass.scheduling.policies.reason_aware_routing import (
 from su_compass.scheduling.policies.one_report_structural import (
     predict_one_report_structural,
 )
+from su_compass.scheduling.policies.fair_contribution_state import (
+    FairContributionState,
+)
+from su_compass.scheduling.policies.unified_batch_dispatch import (
+    rank_unified_batch,
+)
+from su_compass.scheduling.policies.quality_gated_contribution import (
+    recommend_contribution_restoration,
+)
 from su_compass.scheduling.predictors.regime_calibrated import RegimeCalibratedPredictor
 from su_compass.scheduling.state_time_model import StateTimeModel, state_group_window
 from su_compass.scheduling.state_driven_config import StateDrivenConfig
@@ -94,6 +103,174 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         self._reason_aware_routing_trace_buffer: List[dict] = []
         self._reason_aware_last_service_time: Dict[str, float] = {}
         self._reason_aware_structural_group_windows: Dict[int, tuple[float, float]] = {}
+        self._fair_contribution_state: FairContributionState | None = None
+        self._fair_contribution_trace_buffer: List[dict] = []
+        self._contribution_restoration_trace_buffer: List[dict] = []
+        self._micro_hold_trace_buffer: List[dict] = []
+        self._unified_batch_trace_buffer: List[dict] = []
+
+    def initialize(self, client_ids: List[str], initial_global_model: Dict) -> None:
+        super().initialize(client_ids, initial_global_model)
+        if (
+            self.state_driven_config.unified_batch_dispatch_mode != "off"
+            or self.state_driven_config.fair_contribution_shadow
+            or self.state_driven_config.contribution_restoration_shadow
+            or self.state_driven_config.micro_hold_shadow
+        ):
+            self._fair_contribution_state = FairContributionState(
+                client_ids,
+                score_cap=self.state_driven_config.fair_contribution_score_cap,
+            )
+
+    def _on_aggregation_inputs(
+        self,
+        *,
+        group_idx: int,
+        staleness: Dict[str, int],
+        local_steps: Dict[str, int],
+        model_versions: Dict[str, int],
+    ) -> None:
+        if self._fair_contribution_state is None:
+            return
+        alpha = float(getattr(self.aggregator, "alpha", 1.0))
+        staleness_fn = getattr(self.aggregator, "staleness_fn", lambda _: 1.0)
+        epoch = self._fair_contribution_state.aggregation_epochs
+        records = self._fair_contribution_state.update(
+            staleness, alpha=alpha, staleness_fn=staleness_fn,
+        )
+        jain = self._fair_contribution_state.jain_index()
+        restoration = {
+            row.client_id: row
+            for row in recommend_contribution_restoration(
+                records,
+                local_steps=local_steps,
+                qmax=self.max_local_steps,
+                rhythm_debt=self._lyapunov_rhythm_debt,
+                rhythm_stop=(
+                    self.state_driven_config
+                    .contribution_restoration_rhythm_stop
+                ),
+                debt_score_cap=(
+                    self.state_driven_config.fair_contribution_score_cap
+                ),
+                bonus_mass_cap=(
+                    self.state_driven_config
+                    .contribution_restoration_bonus_cap
+                ),
+                staleness_hard_cap=(
+                    self.state_driven_config
+                    .contribution_restoration_staleness_cap
+                ),
+            )
+        }
+        for record in records:
+            self._fair_contribution_trace_buffer.append({
+                "aggregation_epoch": epoch,
+                "virtual_time": self._virtual_now,
+                "group_id": group_idx,
+                "client_id": record.client_id,
+                "target_share": record.target_share,
+                "participated": int(record.client_id in staleness),
+                "local_steps": local_steps.get(record.client_id, 0),
+                "model_version": model_versions.get(record.client_id, -1),
+                "staleness": record.staleness,
+                "raw_aggregation_weight": record.raw_weight,
+                "normalized_aggregation_share": record.normalized_weight,
+                "target_effective_contribution": (
+                    record.target_effective_contribution
+                ),
+                "effective_contribution": record.effective_contribution,
+                "fair_debt_before": record.fair_debt_before,
+                "fair_debt_raw": record.fair_debt_raw,
+                "fair_debt_score": record.fair_debt_score,
+                "fair_debt_overflow": record.fair_debt_overflow,
+                "cumulative_jain": jain,
+            })
+            if self.state_driven_config.contribution_restoration_shadow:
+                proposed = restoration[record.client_id]
+                self._contribution_restoration_trace_buffer.append({
+                    "aggregation_epoch": epoch,
+                    "virtual_time": self._virtual_now,
+                    "group_id": group_idx,
+                    "client_id": record.client_id,
+                    "participated": int(record.client_id in staleness),
+                    "local_steps": local_steps.get(record.client_id, 0),
+                    "staleness": record.staleness,
+                    "rhythm_debt": self._lyapunov_rhythm_debt,
+                    "fair_debt_before": record.fair_debt_before,
+                    "fair_debt_score": proposed.debt_score,
+                    "base_share": proposed.base_share,
+                    "quality_score": proposed.quality_score,
+                    "eligible": int(proposed.eligible),
+                    "reason": proposed.reason,
+                    "requested_bonus": proposed.requested_bonus,
+                    "allocated_bonus": proposed.allocated_bonus,
+                    "proposed_share": proposed.proposed_share,
+                    "share_delta": (
+                        proposed.proposed_share - proposed.base_share
+                    ),
+                    "applied": 0,
+                })
+
+    def _order_arrived_clients_for_redispatch(
+        self, client_ids: List[str],
+    ) -> List[str]:
+        baseline = super()._order_arrived_clients_for_redispatch(client_ids)
+        state = self._fair_contribution_state
+        mode = self.state_driven_config.unified_batch_dispatch_mode
+        if state is None or mode == "off" or len(client_ids) <= 1:
+            return baseline
+
+        safe_duration: Dict[str, float] = {}
+        for cid in client_ids:
+            curve, _ = self._state_time_model.predict_curve(
+                client_id=cid,
+                dispatch_time=self._virtual_now,
+                qs=[self.max_local_steps],
+                runtime_state=self._runtime_states.get(cid),
+                speed_fallback=float(self.client_info[cid]["speed"]),
+            )
+            point = curve[0] if curve else None
+            safe_duration[cid] = (
+                float(point.safe_duration)
+                if point is not None
+                else float(self.client_info[cid]["speed"]) * self.max_local_steps
+            )
+        ranked = rank_unified_batch(
+            client_ids,
+            fair_debt={cid: state.score(cid) for cid in client_ids},
+            safe_duration=safe_duration,
+            rhythm_target=self.state_driven_config.lyapunov_rhythm_target,
+        )
+        proposed = [row.client_id for row in ranked]
+        batch_id = (
+            f"agg{state.aggregation_epochs - 1}"
+            f"_t{self._virtual_now:.9f}"
+        )
+        baseline_rank = {cid: index for index, cid in enumerate(baseline)}
+        proposed_rank = {cid: index for index, cid in enumerate(proposed)}
+        by_client = {row.client_id: row for row in ranked}
+        for cid in client_ids:
+            row = by_client[cid]
+            self._unified_batch_trace_buffer.append({
+                "batch_id": batch_id,
+                "virtual_time": self._virtual_now,
+                "client_id": cid,
+                "mode": mode,
+                "baseline_speed_rank": baseline_rank[cid],
+                "proposed_rank": proposed_rank[cid],
+                "baseline_anchor": int(baseline_rank[cid] == 0),
+                "proposed_anchor": int(proposed_rank[cid] == 0),
+                "fair_debt_score": row.fair_debt,
+                "predicted_safe_duration": row.predicted_safe_duration,
+                "freshness": row.freshness,
+                "service_probability": row.service_probability,
+                "fair_benefit": row.benefit,
+                "time_cost": row.time_cost,
+                "priority": row.priority,
+                "order_changed": int(baseline != proposed),
+            })
+        return proposed if mode == "apply" else baseline
 
     @staticmethod
     def _parse_target_rates(spec: str) -> Dict[str, float]:
@@ -139,6 +316,76 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         if state is not None:
             self._runtime_states[event.client_id] = state
         return super().on_client_upload(event, virtual_now)
+
+    def on_timer_event(self, event: VirtualEvent, virtual_now: float):
+        """Record a bounded deadline-hold counterfactual without applying it."""
+        self._virtual_now = virtual_now
+        cfg = self.state_driven_config
+        group_idx = event.payload.get("group_idx")
+        if (
+            cfg.micro_hold_shadow
+            and group_idx is not None
+            and group_idx in self.arrival_group
+        ):
+            group = self.arrival_group[group_idx]
+            wait_cap = (
+                cfg.micro_hold_time_ratio * cfg.lyapunov_rhythm_target
+            )
+            predicted = group.get("predicted_finish_times", {})
+            safe = group.get("safe_finish_times", {})
+            for client_id in list(group.get("clients", [])):
+                predicted_finish = float(predicted.get(client_id, math.inf))
+                safe_finish = float(safe.get(client_id, math.inf))
+                predicted_wait = max(0.0, predicted_finish - virtual_now)
+                safe_wait = max(0.0, safe_finish - virtual_now)
+                debt = (
+                    self._fair_contribution_state.score(client_id)
+                    if self._fair_contribution_state is not None else 0.0
+                )
+                if not math.isfinite(safe_finish):
+                    eligible, reason = False, "missing_safe_prediction"
+                elif predicted_finish <= virtual_now or safe_finish <= virtual_now:
+                    eligible, reason = False, "pending_after_predicted_finish"
+                elif debt <= 0:
+                    eligible, reason = False, "no_contribution_deficit"
+                elif self._lyapunov_rhythm_debt >= (
+                    cfg.contribution_restoration_rhythm_stop
+                ):
+                    eligible, reason = False, "rhythm_queue_stop"
+                elif predicted_wait > wait_cap:
+                    eligible, reason = False, "predicted_wait_cap"
+                elif safe_wait > wait_cap:
+                    eligible, reason = False, "safe_wait_cap"
+                else:
+                    eligible, reason = True, "near_complete_bounded_hold"
+                self._micro_hold_trace_buffer.append({
+                    "virtual_time": virtual_now,
+                    "group_id": group_idx,
+                    "client_id": client_id,
+                    "assigned_group_id": self.client_info[client_id].get(
+                        "goa", -1
+                    ),
+                    "predicted_finish_time": (
+                        predicted_finish
+                        if math.isfinite(predicted_finish) else ""
+                    ),
+                    "safe_finish_time": (
+                        safe_finish if math.isfinite(safe_finish) else ""
+                    ),
+                    "predicted_wait": (
+                        predicted_wait
+                        if math.isfinite(predicted_wait) else ""
+                    ),
+                    "safe_wait": safe_wait if math.isfinite(safe_wait) else "",
+                    "wait_cap": wait_cap,
+                    "fair_debt_score": debt,
+                    "rhythm_debt": self._lyapunov_rhythm_debt,
+                    "eligible": int(eligible),
+                    "reason": reason,
+                    "recommended": int(eligible),
+                    "applied": 0,
+                })
+        return super().on_timer_event(event, virtual_now)
 
     @staticmethod
     def _pinball(actual: float, quantile_prediction: float, quantile: float) -> float:
@@ -569,7 +816,9 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
                 ))
         return actions
 
-    def _effective_service_v2_create_actions(self, client_id: str, curve):
+    def _effective_service_v2_create_actions(
+        self, client_id: str, curve, *, required_q: int | None = None,
+    ):
         reference_q = self._lyapunov_q_references.get(client_id)
         if reference_q is None:
             return []
@@ -592,6 +841,15 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             qmin=self.min_local_steps, qmax=self.max_local_steps,
             trust_eta=self.state_driven_config.lyapunov_q_trust_eta,
         )
+        if required_q is not None:
+            trust_upper = min(
+                self.max_local_steps,
+                math.ceil(
+                    self.state_driven_config.lyapunov_q_trust_eta * reference_q
+                ),
+            )
+            if required_q in by_q and self.min_local_steps <= required_q <= trust_upper:
+                qs = sorted(set(qs) | {required_q})
         recent = sorted(self._lyapunov_recent_intervals[-12:])
         if recent:
             recruit_expected_raw = recent[len(recent) // 2]
@@ -1239,8 +1497,12 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         cfg = self.state_driven_config
         if not cfg.reason_aware_routing_shadow:
             return
-        selected = decision.action if decision.feasible else None
-        if selected is None and applied_q > 0:
+        self._finalize_reason_aware_batch(self._virtual_now)
+        # Shadow comparisons are always anchored to the action that V2.3
+        # actually dispatched.  A feasible but unapplied internal candidate
+        # must never leak its Q/group into the counterfactual baseline.
+        selected = None
+        if applied_q > 0:
             applied_point = next(
                 (item for item in curve if item.q == applied_q),
                 min(curve, key=lambda item: abs(item.q - applied_q))
@@ -1300,6 +1562,7 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             point = min(curve, key=lambda item: item.q)
         cause = classify_slow_cause(point)
         structural = None
+        structural_qmax = None
         state = self._runtime_states.get(client_id)
         if (
             cfg.reason_aware_one_report_structural_shadow
@@ -1341,6 +1604,49 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
                 ),
             )
             if structural.eligible:
+                structural_q_cap = min(
+                    self.max_local_steps,
+                    max(
+                        selected.q,
+                        int(
+                            math.floor(
+                                selected.q
+                                * cfg.communication_amortized_q_max_ratio
+                            )
+                        ),
+                    ),
+                )
+                structural_qmax = predict_one_report_structural(
+                    q=structural_q_cap,
+                    observed_q=observed_q,
+                    observed_round_duration=float(
+                        getattr(state, "round_time_mean", 0.0)
+                    ),
+                    observed_compute_duration=(
+                        float(
+                            getattr(
+                                state, "compute_step_time_mean", 0.0
+                            )
+                        )
+                        * observed_q
+                    ),
+                    observed_communication_duration=float(
+                        getattr(state, "communication_time_mean", 0.0)
+                    ),
+                    observed_spike_duration=float(
+                        getattr(state, "spike_delay_mean", 0.0)
+                    ),
+                    observed_availability_duration=float(
+                        getattr(state, "availability_wait_mean", 0.0)
+                    ),
+                    num_reports=1,
+                    communication_ratio_gate=(
+                        cfg.reason_aware_one_report_communication_gate
+                    ),
+                    safety_fraction=(
+                        cfg.reason_aware_one_report_safety_fraction
+                    ),
+                )
                 total = max(structural.predicted_duration, 1e-12)
                 cause = SlowCause(
                     label="extreme_communication_bound",
@@ -1378,6 +1684,108 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             <= cfg.reason_aware_cadence_max_ratio * cfg.lyapunov_rhythm_target
             and at_risk_groups == 0
         )
+        fair_debt_score = (
+            self._fair_contribution_state.score(client_id)
+            if self._fair_contribution_state is not None else 0.0
+        )
+        amortized_q_point = point
+        amortized_q_eligible = bool(
+            cfg.communication_amortized_q_shadow
+            and selected is not None
+            and point is not None
+            and cause.label == "extreme_communication_bound"
+            and service_age_periods
+            >= cfg.communication_amortized_q_age_periods
+            and cause.communication_ratio
+            >= cfg.communication_amortized_q_ratio_gate
+            and system_healthy
+            and fair_debt_score > 0.0
+        )
+        if amortized_q_eligible:
+            marginal_budget = (
+                cfg.communication_amortized_q_time_ratio
+                * cfg.lyapunov_rhythm_target
+            )
+            candidates = []
+            q_cap = min(
+                self.max_local_steps,
+                max(
+                    applied_q,
+                    int(
+                        math.floor(
+                            applied_q
+                            * cfg.communication_amortized_q_max_ratio
+                        )
+                    ),
+                ),
+            )
+            for candidate in curve:
+                if (
+                    candidate.q < applied_q
+                    or candidate.q > q_cap
+                    or candidate.used_fallback
+                ):
+                    continue
+                if (
+                    candidate.predicted_duration - point.predicted_duration
+                    > marginal_budget
+                    or candidate.safe_duration - point.safe_duration
+                    > marginal_budget
+                ):
+                    continue
+                if (
+                    selected.mode == "join"
+                    and candidate.safe_finish_time
+                    > selected.latest_arrival_time
+                ):
+                    continue
+                candidates.append(candidate)
+            if candidates:
+                amortized_q_point = max(
+                    candidates, key=lambda candidate: candidate.q
+                )
+        structural_amortized_q = False
+        if (
+            cfg.communication_amortized_q_shadow
+            and structural is not None
+            and structural.eligible
+            and structural_qmax is not None
+            and selected is not None
+            and fair_debt_score > 0.0
+            and system_healthy
+            and service_age_periods
+            >= cfg.communication_amortized_q_age_periods
+        ):
+            marginal_budget = (
+                cfg.communication_amortized_q_time_ratio
+                * cfg.lyapunov_rhythm_target
+            )
+            structural_deadline_safe = True
+            if selected.mode == "join":
+                existing_window = (
+                    self._reason_aware_structural_group_windows.get(
+                        selected.group_id
+                    )
+                )
+                structural_latest = max(
+                    existing_window[1] if existing_window else -math.inf,
+                    self._virtual_now + structural.safe_duration,
+                )
+                structural_deadline_safe = (
+                    self._virtual_now + structural_qmax.safe_duration
+                    <= structural_latest
+                )
+            if (
+                structural_qmax.predicted_duration
+                - structural.predicted_duration
+                <= marginal_budget
+                and structural_qmax.safe_duration
+                - structural.safe_duration
+                <= marginal_budget
+                and structural_deadline_safe
+            ):
+                structural_amortized_q = True
+                amortized_q_eligible = True
         route = recommend_reason_aware_route(
             cause=cause,
             v23_action=selected,
@@ -1402,6 +1810,26 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
                 self._virtual_now + structural.predicted_duration,
                 self._virtual_now + structural.safe_duration,
             )
+        elif (
+            structural is not None
+            and structural.eligible
+            and selected is not None
+            and selected.mode == "join"
+        ):
+            current = self._reason_aware_structural_group_windows.get(
+                selected.group_id
+            )
+            if current is not None:
+                self._reason_aware_structural_group_windows[selected.group_id] = (
+                    max(
+                        current[0],
+                        self._virtual_now + structural.predicted_duration,
+                    ),
+                    max(
+                        current[1],
+                        self._virtual_now + structural.safe_duration,
+                    ),
+                )
         corrected_window = (
             self._reason_aware_structural_group_windows.get(selected.group_id)
             if selected is not None and selected.mode == "join" else None
@@ -1413,43 +1841,84 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         corrected_cadence_excess = max(
             0.0, corrected_sojourn - cfg.lyapunov_rhythm_target
         )
-        elastic_join_avoidance = False
-        if (
+        selected_join_sojourn = (
+            float(selected.predicted_sojourn)
+            if selected is not None and selected.mode == "join" else 0.0
+        )
+        observed_join_sojourn = max(
+            corrected_sojourn, selected_join_sojourn,
+        )
+        mature_join_limit = (
+            cfg.reason_aware_cadence_max_ratio
+            * cfg.lyapunov_rhythm_target
+        )
+        mature_long_join = bool(
+            selected is not None
+            and selected.mode == "join"
+            and cause.mature
+            and cause.label != "extreme_communication_bound"
+            and observed_join_sojourn > mature_join_limit
+        )
+        structural_long_join = bool(
             corrected_window is not None
             and corrected_cadence_excess > 0.0
             and cause.label != "extreme_communication_bound"
+        )
+        elastic_join_avoidance = False
+        same_q_create = None
+        coordinated_batch_role = ""
+        if (
+            (structural_long_join or mature_long_join)
             and selected is not None
         ):
-            create = min(
-                (
-                    action for action in scored
-                    if action.legal
-                    and action.mode == "create"
-                    and action.q == selected.q
-                ),
-                key=lambda action: (action.score, action.predicted_sojourn),
-                default=None,
+            create_actions, *_ = self._effective_service_v2_create_actions(
+                client_id, curve, required_q=applied_q,
             )
-            if create is not None:
+            same_q_create = next(
+                (action for action in create_actions if action.q == applied_q),
+                None,
+            )
+            if same_q_create is not None:
+                same_q_create = self._lyapunov_policy.score(
+                    [same_q_create],
+                    rhythm_debt=self._lyapunov_rhythm_debt,
+                    workload_debt=self._lyapunov_workload_debt.get(
+                        client_id, 0.0
+                    ),
+                    qmax=self.max_local_steps,
+                    qmin=self.min_local_steps,
+                    fedcompass_join_q=self._lyapunov_q_references.get(
+                        client_id, -1
+                    ),
+                )[0]
+            if same_q_create is not None and same_q_create.legal:
                 route = ReasonAwareRoute(
                     lane="elastic_unified",
                     mode="create",
                     group_id=-1,
                     q=selected.q,
-                    reason="corrected_anchor_cadence_avoidance",
+                    reason=(
+                        "mature_join_cadence_avoidance"
+                        if mature_long_join
+                        else "corrected_anchor_cadence_avoidance"
+                    ),
                     compatible_background_group=-1,
                     anchor_eligible=False,
                     changed=True,
                 )
                 elastic_join_avoidance = True
-        shadow_action = next((
-            action for action in scored
-            if (
-                action.legal
-                and action.mode == route.mode
-                and action.group_id == route.group_id
-            )
-        ), selected)
+        shadow_action = (
+            same_q_create
+            if elastic_join_avoidance
+            else next((
+                action for action in scored
+                if (
+                    action.legal
+                    and action.mode == route.mode
+                    and action.group_id == route.group_id
+                )
+            ), selected)
+        )
         self._reason_aware_routing_trace_buffer.append({
             "decision_id": self._decision_id(client_id),
             "virtual_time": self._virtual_now,
@@ -1565,8 +2034,146 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
             "structural_group_cadence_excess": (
                 corrected_cadence_excess if corrected_window else ""
             ),
+            "join_observed_sojourn": observed_join_sojourn,
+            "join_cadence_limit": mature_join_limit,
+            "mature_long_join_avoidance": int(mature_long_join),
             "elastic_join_avoidance": int(elastic_join_avoidance),
+            "same_q_create_candidate": int(same_q_create is not None),
+            "same_q_create_legal": int(
+                same_q_create is not None and same_q_create.legal
+            ),
+            "same_q_create_score": (
+                same_q_create.score if same_q_create is not None else ""
+            ),
+            "same_q_create_expected_time": (
+                same_q_create.group_frontier_time
+                if same_q_create is not None else ""
+            ),
+            "same_q_create_latest_time": (
+                same_q_create.latest_arrival_time
+                if same_q_create is not None else ""
+            ),
+            "coordinated_batch_role": coordinated_batch_role,
+            "coordinated_batch_group_id": (
+                route.group_id if coordinated_batch_role else ""
+            ),
+            "fair_debt_score": fair_debt_score,
+            "communication_amortized_q_enabled": int(
+                cfg.communication_amortized_q_shadow
+            ),
+            "communication_amortized_q_eligible": int(
+                amortized_q_eligible
+            ),
+            "communication_amortized_q": (
+                structural_qmax.q
+                if structural_amortized_q and structural_qmax is not None
+                else (
+                    amortized_q_point.q
+                    if amortized_q_point is not None else ""
+                )
+            ),
+            "communication_amortized_q_added": (
+                structural_qmax.q - applied_q
+                if structural_amortized_q and structural_qmax is not None
+                else (
+                    amortized_q_point.q - applied_q
+                    if amortized_q_point is not None else 0
+                )
+            ),
+            "communication_amortized_added_predicted_duration": (
+                structural_qmax.predicted_duration
+                - structural.predicted_duration
+                if (
+                    structural_amortized_q
+                    and structural_qmax is not None
+                    and structural is not None
+                )
+                else (
+                    amortized_q_point.predicted_duration
+                    - point.predicted_duration
+                    if amortized_q_point is not None and point is not None
+                    else 0.0
+                )
+            ),
+            "communication_amortized_added_safe_duration": (
+                structural_qmax.safe_duration - structural.safe_duration
+                if (
+                    structural_amortized_q
+                    and structural_qmax is not None
+                    and structural is not None
+                )
+                else (
+                    amortized_q_point.safe_duration - point.safe_duration
+                    if amortized_q_point is not None and point is not None
+                    else 0.0
+                )
+            ),
+            "communication_amortized_deadline_safe": int(
+                structural_amortized_q
+                or amortized_q_point is None
+                or selected is None
+                or selected.mode != "join"
+                or amortized_q_point.safe_finish_time
+                <= selected.latest_arrival_time
+            ),
         })
+
+    def _finalize_reason_aware_batch(
+        self, next_virtual_time: float | None = None,
+    ) -> None:
+        rows = self._reason_aware_routing_trace_buffer
+        if not rows:
+            return
+        batch_time = float(rows[-1]["virtual_time"])
+        if (
+            next_virtual_time is not None
+            and math.isclose(
+                batch_time, next_virtual_time,
+                rel_tol=0.0, abs_tol=1e-9,
+            )
+        ):
+            return
+        batch = []
+        for row in reversed(rows):
+            if not math.isclose(
+                float(row["virtual_time"]), batch_time,
+                rel_tol=0.0, abs_tol=1e-9,
+            ):
+                break
+            if int(row.get("elastic_join_avoidance", 0)) == 1:
+                batch.append(row)
+        if len(batch) <= 1:
+            return
+        # The widest legal same-Q create window is the only anchor that can
+        # safely admit every narrower same-time candidate.
+        anchor = max(
+            batch,
+            key=lambda row: float(row["same_q_create_latest_time"]),
+        )
+        group_id = -1_000_000 - len(rows)
+        anchor_latest = float(anchor["same_q_create_latest_time"])
+        for row in batch:
+            candidate_latest = float(row["same_q_create_latest_time"])
+            row["shadow_group_id"] = group_id
+            row["coordinated_batch_group_id"] = group_id
+            row["recommended_lane"] = "elastic_unified"
+            if row is anchor:
+                row["shadow_mode"] = "create"
+                row["route_reason"] = "coordinated_same_batch_anchor"
+                row["anchor_eligible"] = 1
+                row["coordinated_batch_role"] = "anchor"
+            elif candidate_latest <= anchor_latest:
+                row["shadow_mode"] = "join"
+                row["route_reason"] = "coordinated_same_batch_join"
+                row["anchor_eligible"] = 0
+                row["coordinated_batch_role"] = "join"
+                row["shadow_deadline_safe"] = 1
+            else:
+                # Defensive fallback; max(latest) should make this unreachable.
+                row["shadow_mode"] = "create"
+                row["route_reason"] = "coordinated_incompatible_create"
+                row["coordinated_batch_role"] = "extra_anchor"
+            row["recommendation_changed"] = 1
 
     def _create_group(self, client_id: str) -> List[VirtualEvent]:
         cfg = self.state_driven_config
@@ -1841,6 +2448,27 @@ class VirtualStateDrivenCompassController(VirtualFedCompassController):
         return rows
 
     def pop_reason_aware_routing_traces(self):
+        self._finalize_reason_aware_batch()
         rows = self._reason_aware_routing_trace_buffer
         self._reason_aware_routing_trace_buffer = []
+        return rows
+
+    def pop_fair_contribution_traces(self):
+        rows = self._fair_contribution_trace_buffer
+        self._fair_contribution_trace_buffer = []
+        return rows
+
+    def pop_contribution_restoration_traces(self):
+        rows = self._contribution_restoration_trace_buffer
+        self._contribution_restoration_trace_buffer = []
+        return rows
+
+    def pop_micro_hold_traces(self):
+        rows = self._micro_hold_trace_buffer
+        self._micro_hold_trace_buffer = []
+        return rows
+
+    def pop_unified_batch_dispatch_traces(self):
+        rows = self._unified_batch_trace_buffer
+        self._unified_batch_trace_buffer = []
         return rows

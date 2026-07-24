@@ -376,6 +376,18 @@ def run_experiment(args: argparse.Namespace) -> None:
         if hasattr(controller, "pop_reason_aware_routing_traces"):
             for row in controller.pop_reason_aware_routing_traces():
                 trace.record_reason_aware_routing(row)
+        if hasattr(controller, "pop_fair_contribution_traces"):
+            for row in controller.pop_fair_contribution_traces():
+                trace.record_fair_contribution(row)
+        if hasattr(controller, "pop_contribution_restoration_traces"):
+            for row in controller.pop_contribution_restoration_traces():
+                trace.record_contribution_restoration(row)
+        if hasattr(controller, "pop_micro_hold_traces"):
+            for row in controller.pop_micro_hold_traces():
+                trace.record_micro_hold(row)
+        if hasattr(controller, "pop_unified_batch_dispatch_traces"):
+            for row in controller.pop_unified_batch_dispatch_traces():
+                trace.record_unified_batch_dispatch(row)
 
         if hasattr(controller, "pop_state_q_traces"):
             for state_q in controller.pop_state_q_traces():
@@ -847,6 +859,38 @@ def _state_driven_config_from_args(args) -> StateDrivenConfig:
         reason_aware_one_report_safety_fraction=(
             args.sd_reason_aware_one_report_safety_fraction
         ),
+        unified_batch_dispatch_mode=args.sd_unified_batch_dispatch_mode,
+        fair_contribution_shadow=args.sd_fair_contribution_shadow == "on",
+        fair_contribution_score_cap=args.sd_fair_contribution_score_cap,
+        communication_amortized_q_shadow=(
+            args.sd_communication_amortized_q_shadow == "on"
+        ),
+        communication_amortized_q_age_periods=(
+            args.sd_communication_amortized_q_age_periods
+        ),
+        communication_amortized_q_ratio_gate=(
+            args.sd_communication_amortized_q_ratio_gate
+        ),
+        communication_amortized_q_time_ratio=(
+            args.sd_communication_amortized_q_time_ratio
+        ),
+        communication_amortized_q_max_ratio=(
+            args.sd_communication_amortized_q_max_ratio
+        ),
+        contribution_restoration_shadow=(
+            args.sd_contribution_restoration_shadow == "on"
+        ),
+        contribution_restoration_bonus_cap=(
+            args.sd_contribution_restoration_bonus_cap
+        ),
+        contribution_restoration_rhythm_stop=(
+            args.sd_contribution_restoration_rhythm_stop
+        ),
+        contribution_restoration_staleness_cap=(
+            args.sd_contribution_restoration_staleness_cap
+        ),
+        micro_hold_shadow=args.sd_micro_hold_shadow == "on",
+        micro_hold_time_ratio=args.sd_micro_hold_time_ratio,
         min_group_slack=args.sd_min_group_slack,
         max_group_slack=args.sd_max_group_slack,
     )
@@ -1101,6 +1145,56 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--sd_reason_aware_one_report_safety_fraction",
         type=float, default=0.10,
+    )
+    parser.add_argument(
+        "--sd_unified_batch_dispatch_mode",
+        choices=["off", "shadow", "apply"], default="off",
+    )
+    parser.add_argument(
+        "--sd_fair_contribution_score_cap", type=float, default=2.0,
+    )
+    parser.add_argument(
+        "--sd_fair_contribution_shadow",
+        choices=["on", "off"], default="off",
+    )
+    parser.add_argument(
+        "--sd_communication_amortized_q_shadow",
+        choices=["on", "off"], default="off",
+    )
+    parser.add_argument(
+        "--sd_communication_amortized_q_age_periods",
+        type=float, default=4.0,
+    )
+    parser.add_argument(
+        "--sd_communication_amortized_q_ratio_gate",
+        type=float, default=0.80,
+    )
+    parser.add_argument(
+        "--sd_communication_amortized_q_time_ratio",
+        type=float, default=0.20,
+    )
+    parser.add_argument(
+        "--sd_communication_amortized_q_max_ratio",
+        type=float, default=3.0,
+    )
+    parser.add_argument(
+        "--sd_contribution_restoration_shadow",
+        choices=["on", "off"], default="off",
+    )
+    parser.add_argument(
+        "--sd_contribution_restoration_bonus_cap", type=float, default=0.05,
+    )
+    parser.add_argument(
+        "--sd_contribution_restoration_rhythm_stop", type=float, default=44.0,
+    )
+    parser.add_argument(
+        "--sd_contribution_restoration_staleness_cap", type=int, default=8,
+    )
+    parser.add_argument(
+        "--sd_micro_hold_shadow", choices=["on", "off"], default="off",
+    )
+    parser.add_argument(
+        "--sd_micro_hold_time_ratio", type=float, default=0.20,
     )
     parser.add_argument("--sd_min_group_slack", type=float, default=0.5)
     parser.add_argument("--sd_max_group_slack", type=float, default=120.0)

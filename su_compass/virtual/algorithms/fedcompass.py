@@ -342,6 +342,14 @@ class VirtualFedCompassController(VirtualAlgorithmController):
         if not buffer:
             # buffer=False 是“真正立即聚合”：首次到达或无组客户端直接贡献一次全局更新。
             agg_staleness = self.global_timestamp - self.client_info[client_id]["timestamp"]
+            self._on_aggregation_inputs(
+                group_idx=-1,
+                staleness={client_id: agg_staleness},
+                local_steps={client_id: self.client_info[client_id]["local_steps"]},
+                model_versions={
+                    client_id: self.client_info[client_id]["timestamp"]
+                },
+            )
             global_model = self.aggregator.aggregate(
                 client_id,
                 local_model,
@@ -469,6 +477,12 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             cid: self.global_timestamp - timestamp[cid]
             for cid in timestamp
         }
+        self._on_aggregation_inputs(
+            group_idx=group_idx,
+            staleness=staleness,
+            local_steps=local_steps_map,
+            model_versions=timestamp,
+        )
 
         # general_buffer 一旦被本次 group 聚合消费，就必须清空，避免迟到更新重复贡献。
         self.general_buffer = {
@@ -531,12 +545,14 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             self.client_info[cid]["timestamp"] = self.global_timestamp
             client_speeds.append((cid, self.client_info[cid]["speed"]))
         # 先给快客户端分组，使它们更可能作为新 group 的时间锚点。
-        sorted_client_speeds = sorted(client_speeds, key=lambda x: x[1], reverse=False)
+        ordered_client_ids = self._order_arrived_clients_for_redispatch(
+            [cid for cid, _ in client_speeds]
+        )
 
         self.arrival_group[group_idx]["expected_arrival_time"] = 0
         self.arrival_group[group_idx]["latest_arrival_time"] = 0
 
-        for cid, _ in sorted_client_speeds:
+        for cid in ordered_client_ids:
             assign_events = self._assign_group(cid)
             new_events.extend(assign_events)
 
@@ -564,6 +580,22 @@ class VirtualFedCompassController(VirtualAlgorithmController):
             del self.group_buffer[group_idx]
 
         return new_events, staleness
+
+    def _on_aggregation_inputs(
+        self,
+        *,
+        group_idx: int,
+        staleness: Dict[str, int],
+        local_steps: Dict[str, int],
+        model_versions: Dict[str, int],
+    ) -> None:
+        """Read-only extension hook; the FedCompass baseline remains unchanged."""
+
+    def _order_arrived_clients_for_redispatch(
+        self, client_ids: List[str],
+    ) -> List[str]:
+        """Preserve the original FedCompass speed-first redispatch order."""
+        return sorted(client_ids, key=lambda cid: self.client_info[cid]["speed"])
 
     def _assign_group(self, client_id: str) -> List[VirtualEvent]:
         """为客户端分配 arrival group。

@@ -47,6 +47,20 @@ class StateDrivenConfig:
     reason_aware_one_report_structural_shadow: bool = False
     reason_aware_one_report_communication_gate: float = 0.95
     reason_aware_one_report_safety_fraction: float = 0.10
+    unified_batch_dispatch_mode: str = "off"
+    fair_contribution_shadow: bool = False
+    fair_contribution_score_cap: float = 2.0
+    communication_amortized_q_shadow: bool = False
+    communication_amortized_q_age_periods: float = 4.0
+    communication_amortized_q_ratio_gate: float = 0.80
+    communication_amortized_q_time_ratio: float = 0.20
+    communication_amortized_q_max_ratio: float = 3.0
+    contribution_restoration_shadow: bool = False
+    contribution_restoration_bonus_cap: float = 0.05
+    contribution_restoration_rhythm_stop: float = 44.0
+    contribution_restoration_staleness_cap: int = 8
+    micro_hold_shadow: bool = False
+    micro_hold_time_ratio: float = 0.20
 
     def __post_init__(self) -> None:
         legal = {
@@ -109,3 +123,23 @@ class StateDrivenConfig:
             raise ValueError("one-report communication gate must be in [0, 1]")
         if self.reason_aware_one_report_safety_fraction < 0:
             raise ValueError("one-report safety fraction must be non-negative")
+        if self.unified_batch_dispatch_mode not in {"off", "shadow", "apply"}:
+            raise ValueError(
+                "unified_batch_dispatch_mode must be off, shadow or apply"
+            )
+        if self.fair_contribution_score_cap <= 0:
+            raise ValueError("fair contribution score cap must be positive")
+        if (
+            self.communication_amortized_q_age_periods < 0
+            or not 0 <= self.communication_amortized_q_ratio_gate <= 1
+            or self.communication_amortized_q_time_ratio < 0
+            or self.communication_amortized_q_max_ratio < 1
+        ):
+            raise ValueError("invalid communication-amortized Q configuration")
+        if (
+            not 0 <= self.contribution_restoration_bonus_cap <= 1
+            or self.contribution_restoration_rhythm_stop <= 0
+            or self.contribution_restoration_staleness_cap < 0
+            or self.micro_hold_time_ratio < 0
+        ):
+            raise ValueError("invalid contribution restoration configuration")

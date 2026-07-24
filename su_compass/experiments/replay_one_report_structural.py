@@ -64,6 +64,18 @@ def analyze(
             communication_ratio_gate=communication_ratio_gate,
             safety_fraction=safety_fraction,
         )
+        qmax_prediction = predict_one_report_structural(
+            q=200,
+            observed_q=observed_q,
+            observed_round_duration=_number(first, "round_time"),
+            observed_compute_duration=_number(first, "train_time"),
+            observed_communication_duration=(
+                _number(first, "download_time") + _number(first, "upload_time")
+            ),
+            num_reports=1,
+            communication_ratio_gate=communication_ratio_gate,
+            safety_fraction=safety_fraction,
+        )
         records.append({
             "client_id": client_id,
             "profile_type": first.get("profile_type", ""),
@@ -82,6 +94,21 @@ def analyze(
             "point_prediction_better": (
                 abs(prediction.predicted_duration - actual)
                 < abs(fedcompass - actual)
+            ),
+            "qmax_candidate": 200,
+            "qmax_added_q": 200 - next_q,
+            "qmax_added_predicted_duration": (
+                qmax_prediction.predicted_duration
+                - prediction.predicted_duration
+            ),
+            "qmax_added_safe_duration": (
+                qmax_prediction.safe_duration
+                - prediction.safe_duration
+            ),
+            "qmax_counterfactual_actual_duration": (
+                actual
+                + qmax_prediction.compute_duration
+                - prediction.compute_duration
             ),
         })
 
@@ -148,6 +175,27 @@ def analyze(
     def mean(field: str) -> float:
         return statistics.mean(row[field] for row in eligible) if eligible else 0.0
 
+    eligible_qmax = [
+        row for row in eligible
+        if row["qmax_added_q"] > 0
+        and row["qmax_added_predicted_duration"] <= 0.2 * 16.4
+        and row["qmax_added_safe_duration"] <= 0.2 * 16.4
+    ]
+    aggregated_work = 0
+    aggregated_slow_work = 0
+    slow_ids = {"client_5", "client_6"}
+    for aggregation in _read(run_dir / "aggregation_trace.csv"):
+        for client_id, q in json.loads(
+            aggregation["per_client_local_steps"]
+        ).items():
+            aggregated_work += int(q)
+            if client_id in slow_ids:
+                aggregated_slow_work += int(q)
+    added_aggregated_q = sum(
+        row["qmax_added_q"] for row in eligible_qmax
+        if row["client_id"] in slow_ids
+    )
+
     return {
         "scope": (
             "fixed_v2_3_trajectory_one_report_prediction_replay_"
@@ -191,6 +239,37 @@ def analyze(
                 "A corrected long anchor window makes the slow anchor timing "
                 "honest. V2.3 cadence would see the long sojourn, but a fixed-"
                 "trajectory replay cannot prove downstream join/create choices."
+            ),
+        },
+        "communication_amortized_q": {
+            "eligible_records": eligible_qmax,
+            "changed_clients": [
+                row["client_id"] for row in eligible_qmax
+            ],
+            "added_aggregated_q": added_aggregated_q,
+            "max_added_predicted_duration": max(
+                (
+                    row["qmax_added_predicted_duration"]
+                    for row in eligible_qmax
+                ),
+                default=0.0,
+            ),
+            "max_added_safe_duration": max(
+                row["qmax_added_safe_duration"]
+                for row in eligible_qmax
+            ) if eligible_qmax else 0.0,
+            "base_slow_work_share": (
+                aggregated_slow_work / aggregated_work
+                if aggregated_work else 0.0
+            ),
+            "projected_slow_work_share": (
+                (aggregated_slow_work + added_aggregated_q)
+                / (aggregated_work + added_aggregated_q)
+                if aggregated_work + added_aggregated_q else 0.0
+            ),
+            "scope": (
+                "fixed_trajectory_structural_duration_and_work_accounting_"
+                "not_accuracy_or_changed_group_replay"
             ),
         },
         "records": records,

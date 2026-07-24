@@ -80,6 +80,32 @@ class ControlledQCandidatesTest(unittest.TestCase):
         )
         self.assertEqual(value("--sd_lyapunov_workload_queue"), "off")
 
+    def test_quality_gated_v2_5_keeps_v23_apply_and_new_actions_shadow(self):
+        command = command_for(
+            "state_driven_quality_gated_v2_5_shadow",
+            120, 2026, Path("out"),
+        )
+        value = lambda flag: command[command.index(flag) + 1]
+        self.assertEqual(value("--sd_lyapunov_mode"), "apply")
+        self.assertEqual(value("--sd_lyapunov_join_cadence_weight"), "1.0")
+        self.assertEqual(value("--sd_fair_contribution_shadow"), "on")
+        self.assertEqual(value("--sd_communication_amortized_q_shadow"), "on")
+        self.assertEqual(value("--sd_contribution_restoration_shadow"), "on")
+        self.assertEqual(value("--sd_micro_hold_shadow"), "on")
+        self.assertEqual(value("--sd_unified_batch_dispatch_mode"), "off")
+
+    def test_mature_cadence_v2_6_keeps_v23_apply(self):
+        command = command_for(
+            "state_driven_mature_cadence_v2_6_shadow",
+            240, 2026, Path("out"),
+        )
+        value = lambda flag: command[command.index(flag) + 1]
+        self.assertEqual(value("--sd_lyapunov_mode"), "apply")
+        self.assertEqual(value("--sd_reason_aware_routing_shadow"), "on")
+        self.assertEqual(value("--sd_contribution_restoration_shadow"), "on")
+        self.assertEqual(value("--sd_micro_hold_shadow"), "on")
+        self.assertEqual(value("--sd_unified_batch_dispatch_mode"), "off")
+
     def test_effective_service_v1_cannot_be_enabled_in_apply(self):
         with self.assertRaisesRegex(ValueError, "Shadow-only"):
             StateDrivenConfig(

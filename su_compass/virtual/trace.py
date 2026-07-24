@@ -319,7 +319,51 @@ REASON_AWARE_ROUTING_TRACE_FIELDS = [
     "one_report_structural_q_unchanged",
     "structural_group_window_active", "structural_group_expected_time",
     "structural_group_latest_time", "structural_group_sojourn",
-    "structural_group_cadence_excess", "elastic_join_avoidance",
+    "structural_group_cadence_excess", "join_observed_sojourn",
+    "join_cadence_limit", "mature_long_join_avoidance",
+    "elastic_join_avoidance",
+    "same_q_create_candidate", "same_q_create_legal",
+    "same_q_create_score",
+    "same_q_create_expected_time", "same_q_create_latest_time",
+    "coordinated_batch_role", "coordinated_batch_group_id",
+    "fair_debt_score", "communication_amortized_q_enabled",
+    "communication_amortized_q_eligible", "communication_amortized_q",
+    "communication_amortized_q_added",
+    "communication_amortized_added_predicted_duration",
+    "communication_amortized_added_safe_duration",
+    "communication_amortized_deadline_safe",
+]
+
+FAIR_CONTRIBUTION_TRACE_FIELDS = [
+    "aggregation_epoch", "virtual_time", "group_id", "client_id",
+    "target_share", "participated", "local_steps", "model_version",
+    "staleness", "raw_aggregation_weight", "normalized_aggregation_share",
+    "target_effective_contribution", "effective_contribution",
+    "fair_debt_before", "fair_debt_raw", "fair_debt_score",
+    "fair_debt_overflow", "cumulative_jain",
+]
+
+CONTRIBUTION_RESTORATION_TRACE_FIELDS = [
+    "aggregation_epoch", "virtual_time", "group_id", "client_id",
+    "participated", "local_steps", "staleness", "rhythm_debt",
+    "fair_debt_before", "fair_debt_score", "base_share",
+    "quality_score", "eligible", "reason", "requested_bonus",
+    "allocated_bonus", "proposed_share", "share_delta", "applied",
+]
+
+MICRO_HOLD_TRACE_FIELDS = [
+    "virtual_time", "group_id", "client_id", "assigned_group_id",
+    "predicted_finish_time", "safe_finish_time", "predicted_wait",
+    "safe_wait", "wait_cap", "fair_debt_score", "rhythm_debt",
+    "eligible", "reason", "recommended", "applied",
+]
+
+UNIFIED_BATCH_DISPATCH_TRACE_FIELDS = [
+    "batch_id", "virtual_time", "client_id", "mode",
+    "baseline_speed_rank", "proposed_rank", "baseline_anchor",
+    "proposed_anchor", "fair_debt_score", "predicted_safe_duration",
+    "freshness", "service_probability", "fair_benefit", "time_cost",
+    "priority", "order_changed",
 ]
 
 STATE_Q_TRACE_FIELDS = [
@@ -629,6 +673,10 @@ class TraceWriter:
         self.effective_service_region_rows: List[Dict[str, Any]] = []
         self.effective_service_shadow_outcome_rows: List[Dict[str, Any]] = []
         self.reason_aware_routing_rows: List[Dict[str, Any]] = []
+        self.fair_contribution_rows: List[Dict[str, Any]] = []
+        self.contribution_restoration_rows: List[Dict[str, Any]] = []
+        self.micro_hold_rows: List[Dict[str, Any]] = []
+        self.unified_batch_dispatch_rows: List[Dict[str, Any]] = []
         self.state_q_rows: List[Dict[str, Any]] = []
         self.group_candidate_shadow_rows: List[Dict[str, Any]] = []
         self.group_recommendation_shadow_rows: List[Dict[str, Any]] = []
@@ -776,6 +824,18 @@ class TraceWriter:
 
     def record_reason_aware_routing(self, row: Dict[str, Any]) -> None:
         self.reason_aware_routing_rows.append(row)
+
+    def record_fair_contribution(self, row: Dict[str, Any]) -> None:
+        self.fair_contribution_rows.append(row)
+
+    def record_contribution_restoration(self, row: Dict[str, Any]) -> None:
+        self.contribution_restoration_rows.append(row)
+
+    def record_micro_hold(self, row: Dict[str, Any]) -> None:
+        self.micro_hold_rows.append(row)
+
+    def record_unified_batch_dispatch(self, row: Dict[str, Any]) -> None:
+        self.unified_batch_dispatch_rows.append(row)
 
     def set_rup_terminal_state(self, row: Dict[str, Any]) -> None:
         self.rup_terminal_state = dict(row)
@@ -1111,6 +1171,30 @@ class TraceWriter:
                 self.output_dir / "reason_aware_routing_shadow_trace.csv",
                 self.reason_aware_routing_rows,
                 REASON_AWARE_ROUTING_TRACE_FIELDS,
+            )
+        if self.fair_contribution_rows:
+            _write_csv(
+                self.output_dir / "fair_contribution_shadow_trace.csv",
+                self.fair_contribution_rows,
+                FAIR_CONTRIBUTION_TRACE_FIELDS,
+            )
+        if self.contribution_restoration_rows:
+            _write_csv(
+                self.output_dir / "contribution_restoration_shadow_trace.csv",
+                self.contribution_restoration_rows,
+                CONTRIBUTION_RESTORATION_TRACE_FIELDS,
+            )
+        if self.micro_hold_rows:
+            _write_csv(
+                self.output_dir / "micro_hold_shadow_trace.csv",
+                self.micro_hold_rows,
+                MICRO_HOLD_TRACE_FIELDS,
+            )
+        if self.unified_batch_dispatch_rows:
+            _write_csv(
+                self.output_dir / "unified_batch_dispatch_shadow_trace.csv",
+                self.unified_batch_dispatch_rows,
+                UNIFIED_BATCH_DISPATCH_TRACE_FIELDS,
             )
         if self.state_q_rows:
             _write_csv(
